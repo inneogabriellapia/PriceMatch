@@ -15,7 +15,9 @@ Come funziona:
 7. accetta una scheda SOLO se il codice è presente nel DOM renderizzato
    o nei campi SKU/MPN/data-sku della pagina;
 8. legge nome e prezzi da quella stessa pagina;
-9. la cache salva soltanto URL/nome, MAI i prezzi.
+9. gli URL candidati passano prima da una cache provvisoria;
+10. solo dopo la verifica del codice vengono promossi nella cache definitiva;
+11. le cache salvano soltanto URL/nome, MAI i prezzi.
 
 Se la ricerca interna fallisce:
 - apre Bing nel browser;

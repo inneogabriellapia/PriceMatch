@@ -1,7 +1,13 @@
 from flask import Flask, render_template, request, jsonify, redirect
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin, urlencode, quote_plus
-import requests, re, json, os, concurrent.futures, sys, subprocess, threading
+from urllib.parse import urlparse, urljoin, urlencode, quote_plus, unquote_plus
+from xml.etree import ElementTree
+from db import get_connection, salva_prodotto, salva_match
+import requests, re, json, os, concurrent.futures, sys, subprocess, threading, time
+import html
+import tempfile
+import unicodedata
+from functools import lru_cache
 
 app = Flask(__name__)
 
@@ -14,12 +20,14 @@ HEADERS = {
 TIMEOUT = 7
 BROWSER_TIMEOUT = 16000
 _cache_lock = threading.Lock()
+SITE_TIMEOUT = 60
+MAX_INTERNAL_RESULTS = 5
+MAX_BING_RESULTS = 5
 _install_lock = threading.Lock()
 _install_attempted = False
 
 def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 def norm_code(x): return re.sub(r"[^A-Z0-9]","",str(x or "").upper())
-def rx_code(code): return re.compile(rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])", re.I)
 
 def load_sites():
     with open(os.path.join(ROOT,"sites.json"),"r",encoding="utf-8") as f:
@@ -63,19 +71,42 @@ def get(url):
 
 #estrae e pulisce il prezzo numerico da un testo generico
 def parse_price(raw):
-    if raw is None or isinstance(raw,bool):return None
-    if isinstance(raw,(int,float)):
-        v=float(raw); return round(v,4) if 0.01<=v<100000 else None
-    s=clean(raw).replace("\xa0"," ")
-    m=re.search(r"(?<!\d)(\d{1,6}(?:[.,]\d{1,4}))(?!\d)",s)
-    if not m:return None
-    n=m.group(1)
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        return round(v, 4) if 0.01 <= v < 100000 else None
+
+    s = clean(raw).replace("\xa0", " ").strip()
+
+    #rende opzionale la parte decimale e supporta interi
+    m = re.search(r"(?<!\d)(\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{1,4})?|\d{1,6}(?:[.,]\d{1,4})?|\d{1,6})(?!\d)", s)
+    if not m:
+        return None
+
+    n = m.group(1).replace(" ", "")
+
+    #gestione combinata di virgola e punto
     if "," in n and "." in n:
-        n=n.replace(".","").replace(",",".") if n.rfind(",")>n.rfind(".") else n.replace(",","")
-    elif "," in n:n=n.replace(",",".")
+        n = n.replace(".", "").replace(",", ".") if n.rfind(",") > n.rfind(".") else n.replace(",", "")
+    elif "," in n:
+        parts = n.split(",")
+        # Se ci sono 3 cifre esatte dopo la virgola, è un separatore di migliaia (es: 1,500)
+        if len(parts) > 1 and len(parts[-1]) == 3 and len(parts[0]) <= 3:
+            n = n.replace(",", "")
+        else:
+            n = n.replace(",", ".")
+    elif "." in n:
+        parts = n.split(".")
+        # Se ci sono 3 cifre esatte dopo il punto, è un separatore di migliaia (es: 1.500 €)
+        if len(parts) > 1 and len(parts[-1]) == 3 and len(parts[0]) <= 3:
+            n = n.replace(".", "")
+
     try:
-        v=float(n); return round(v,4) if 0.01<=v<100000 else None
-    except:return None
+        v = float(n)
+        return round(v, 4) if 0.01 <= v < 100000 else None
+    except ValueError:
+        return None
 
 # trova e legge il numero di pezzi o quantità nel testo
 def qty_start(raw):
@@ -216,13 +247,45 @@ def enhanced_search_query(base, code, fingerprint=None):
     return " ".join(parts)
 
 
+#salva i risultati del match in postgres
+def salva_il_match(prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto):
+    try:
+        conn = get_connection()  #la funzione di connessione
+        cur = conn.cursor()
+
+        query = """
+            INSERT INTO risultati_match 
+            (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto, data_rilevazione)
+            VALUES (%s, %s, %s, %s, %s, NOW());
+        """
+        cur.execute(query, (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto))
+        
+        conn.commit()  #senza questo Postgres annulla l'inserimento!
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Errore durante il salvataggio su DB: {e}")
 # ---------------- CACHE ----------------
 
+#previene la corruzione del file di cache
+def safe_save_json(filepath, data):
+    folder=os.path.dirname(filepath) or "."
+    with tempfile.NamedTemporaryFile(
+        "w", dir=folder, delete=False, encoding="utf-8"
+    ) as tf:
+        json.dump(data, tf, ensure_ascii=False, indent=2)
+        temp_name=tf.name
+    os.replace(temp_name, filepath)
+
 #legge e carica in memoria tutti i dati salvati nel file della cache
+PENDING_CACHE_FILE = os.path.join(ROOT, "product_cache_pending.json")
+
 def cache_load():
     try:
-        with open(CACHE_FILE,"r",encoding="utf-8") as f:return json.load(f)
-    except:return {}
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 #cerca e recupera un prodotto dalla cache usando il dominio e il codice
 def cache_get(base,code):
@@ -237,9 +300,9 @@ def cache_set(base,code,url,title):
         data=cache_load()
         data[key]={"url":url,"title":title}
         try:
-            with open(CACHE_FILE,"w",encoding="utf-8") as f:
-                json.dump(data,f,ensure_ascii=False,indent=2)
-        except:pass
+            safe_save_json(CACHE_FILE,data)
+        except OSError:
+            pass
 
 #rimuove in modo definitivo un prodotto specifico dal file della cache
 def cache_delete(base,code):
@@ -249,16 +312,13 @@ def cache_delete(base,code):
         if key in data:
             data.pop(key,None)
             try:
-                with open(CACHE_FILE,"w",encoding="utf-8") as f:
-                    json.dump(data,f,ensure_ascii=False,indent=2)
-            except:pass
+                safe_save_json(CACHE_FILE,data)
+            except OSError:
+                pass
 
 # ---------------- PRODUCT VERIFICATION ----------------
 
 #controlla se il codice è presente nell'URl, nel titolo o nel testo del sito
-import re
-from functools import lru_cache
-from urllib.parse import unquote_plus
 @lru_cache(maxsize=4096)
 def rx_code(code):
 
@@ -380,7 +440,7 @@ def verify_url(base,url,code):
 # ---------------- FAST RESOLVER ----------------
 
 #trova ed estrae tutti i link utili presenti all'interno della pagina web
-def extract_links(r,base,code):
+def extract_links(r,base,code,allow_price_cards=False):
     out=[];rx=rx_code(code)
     try:
         soup=BeautifulSoup(r.text,"html.parser")
@@ -389,12 +449,15 @@ def extract_links(r,base,code):
             if exact_code_present(soup,r.url,code):out.append(r.url.split("#")[0])
         for a in soup.find_all("a",href=True):
             href=urljoin(r.url,a["href"])
-            if not same_domain(href,base) or is_home(href):continue
+            if not same_domain(href,base) or is_home(href) or is_listing(href):continue
             container=a
             for _ in range(3):
                 if container.parent:container=container.parent
-            hay=f"{href} {clean(a.get_text(' ',strip=True))} {clean(container.get_text(' ',strip=True))}"
-            if rx.search(hay):out.append(href.split("#")[0])
+            context=clean(container.get_text(' ',strip=True))
+            hay=f"{href} {clean(a.get_text(' ',strip=True))} {context}"
+            has_price=bool(re.search(r"(?:€\s*\d|\d+[.,]\d+\s*(?:€|eur)|prezzo\s+per)",context,re.I))
+            if rx.search(hay) or (allow_price_cards and has_price):
+                out.append(href.split("#")[0])
     except:pass
     return list(dict.fromkeys(out))
 
@@ -421,7 +484,7 @@ def real_search_candidates(base,code):
         for method,url,param in forms[:4]:
             try:
                 rr=requests.post(url,data={param:code},headers=HEADERS,timeout=TIMEOUT,allow_redirects=True) if method=="post" else get(url+("&" if "?" in url else "?")+urlencode({param:code}))
-                out.extend(extract_links(rr,base,code))
+                out.extend(extract_links(rr,base,code,allow_price_cards=True))
             except:pass
     except:pass
 
@@ -434,7 +497,7 @@ def real_search_candidates(base,code):
         if out:break
         try:
             rr=get(url+("&" if "?" in url else "?")+urlencode({param:code}))
-            out.extend(extract_links(rr,base,code))
+            out.extend(extract_links(rr,base,code,allow_price_cards=True))
         except:pass
     return list(dict.fromkeys(out))[:10]
 
@@ -449,9 +512,10 @@ def bing_rss_candidates(base,code,fingerprint=None):
         try:
             q=quote_plus(query)
             r=get("https://www.bing.com/search?format=rss&q="+q)
-            soup=BeautifulSoup(r.text,"xml")
-            for item in soup.find_all("item")[:12]:
-                link=item.link.get_text(strip=True) if item.link else ""
+            root=ElementTree.fromstring(r.content)
+            for item in root.findall(".//item")[:12]:
+                node=item.find("link")
+                link=clean(node.text) if node is not None else ""
                 if same_domain(link,base) and not is_home(link):
                     out.append(link.split("#")[0])
             if out:
@@ -661,6 +725,9 @@ SEARCH_INPUT_SELECTORS = [
     'input[name="q"]',
     'input[name="s"]',
     'input[name="search"]',
+    'input[name*="search" i]',
+    'input[id*="search" i]',
+    'input[class*="search" i]',
     'input[name="query"]',
     'input[name="keyword"]',
     'input[name="term"]',
@@ -767,9 +834,11 @@ def rendered_product_payload(page, code, source):
 def browser_find_search_field(page):
     for sel in SEARCH_INPUT_SELECTORS:
         try:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible(timeout=250):
-                return loc
+            matches = page.locator(sel)
+            for index in range(min(matches.count(), 8)):
+                loc = matches.nth(index)
+                if loc.is_visible(timeout=250):
+                    return loc
         except:
             pass
 
@@ -782,9 +851,11 @@ def browser_find_search_field(page):
                 page.wait_for_timeout(300)
                 for sel in SEARCH_INPUT_SELECTORS:
                     try:
-                        loc = page.locator(sel).first
-                        if loc.count() and loc.is_visible(timeout=250):
-                            return loc
+                        matches = page.locator(sel)
+                        for index in range(min(matches.count(), 8)):
+                            loc = matches.nth(index)
+                            if loc.is_visible(timeout=250):
+                                return loc
                     except:
                         pass
         except:
@@ -829,7 +900,7 @@ def browser_candidate_links(page, base, code):
             scored.append((score, href.split("#")[0]))
 
     scored.sort(key=lambda t: t[0], reverse=True)
-    return list(dict.fromkeys(u for _,u in scored))[:15]
+    return list(dict.fromkeys(u for _,u in scored))[:MAX_INTERNAL_RESULTS]
 
 #apre un indirizzo, attende il caricamento e salva il prodotto in memoria se valido
 def browser_open_verified(ctx, url, base, code, source):
@@ -854,7 +925,14 @@ def browser_open_verified(ctx, url, base, code, source):
     return None
 
 #gestisce la ricerca completa del prodotto usando cache, sito interno e bing nel browser
+import time
+
 def browser_resolve_exact(browser, base, code):
+    deadline = time.monotonic() + SITE_TIMEOUT
+
+    def expired():
+        return time.monotonic() >= deadline
+
     """
     This is the primary resolver in V15.
     1) Verify cached URL in a real browser.
@@ -872,7 +950,9 @@ def browser_resolve_exact(browser, base, code):
         # 1. Cache is only a shortcut to the URL; code and prices are re-read live.
         cached = cache_get(base, code)
         if cached and cached.get("url"):
-            p = browser_open_verified(ctx, cached["url"], base, code, "browser · URL già nota")
+            p = browser_open_verified(
+                ctx, cached["url"], base, code, "browser - URL gia nota"
+            )
             if p:
                 return p
             cache_delete(base, code)
@@ -885,45 +965,54 @@ def browser_resolve_exact(browser, base, code):
 
             field = browser_find_search_field(page)
             if field:
-                for variant in code_variants(code):
+                variants = code_variants(code)
+                for index, variant in enumerate(variants):
+                    if expired():
+                        return None
                     try:
                         # Re-open home between variants to avoid stale result states.
-                        if variant != code_variants(code)[0]:
+                        if index:
                             page.goto(base, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
                             page.wait_for_timeout(350)
                             field = browser_find_search_field(page)
-                            if not field:
-                                continue
+                        if not field:
+                            continue
 
                         field.fill(variant)
                         field.press("Enter")
                         page.wait_for_timeout(900)
 
                         # Some sites redirect directly to the product.
-                        payload = rendered_product_payload(page, code, "browser · ricerca interna")
+                        payload = rendered_product_payload(page, code, "browser - ricerca interna")
                         if payload:
                             cache_set(base, code, payload["url"], payload["title"])
                             return payload
 
                         # Otherwise inspect result cards.
                         for url in browser_candidate_links(page, base, code):
-                            p = browser_open_verified(ctx, url, base, code, "browser · risultato interno")
+                            if expired():
+                                return None
+                            p = browser_open_verified(
+                                ctx, url, base, code, "browser - ricerca interna"
+                            )
                             if p:
                                 return p
-                    except:
+                    except Exception:
                         continue
-        except:
+        except Exception:
             pass
         finally:
             try:
                 page.close()
-            except:
+            except Exception:
                 pass
 
         # 3. Browser search engine fallback. Still verify by opening the real ecommerce page.
         page = ctx.new_page()
         try:
             query = quote_plus(f'site:{domain(base)} "{code}"')
+            if expired():
+                return None
             page.goto("https://www.bing.com/search?q="+query, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
             page.wait_for_timeout(700)
 
@@ -942,7 +1031,9 @@ def browser_resolve_exact(browser, base, code):
                 except:
                     pass
 
-            for url in list(dict.fromkeys(urls))[:20]:
+            for url in list(dict.fromkeys(urls))[:MAX_BING_RESULTS]:
+                if expired():
+                    return None
                 if same_domain(url, base) and not is_home(url):
                     p = browser_open_verified(ctx, url, base, code, "browser · Bing")
                     if p:
@@ -959,8 +1050,110 @@ def browser_resolve_exact(browser, base, code):
     finally:
         try:
             ctx.close()
-        except:
+        except Exception:
             pass
+
+
+def browser_force_resolve(browser, base, code):
+    """Fallback indipendente: prova URL di ricerca comuni e Bing RSS.
+
+    Ogni candidato viene comunque aperto nel browser e accettato soltanto
+    quando il codice prodotto e presente nel DOM renderizzato.
+    """
+    ctx = browser.new_context(
+        locale="it-IT",
+        viewport={"width":1365,"height":950},
+        user_agent=HEADERS["User-Agent"]
+    )
+    seen = set()
+    deadline = time.monotonic() + 25
+    try:
+        # Alcuni siti delegano la ricerca ad AccelaSearch. In headless il
+        # widget puo non inizializzarsi, quindi interroghiamo la sua API e
+        # verifichiamo comunque la scheda risultante nel browser reale.
+        discovery = ctx.new_page()
+        try:
+            discovery.goto(base, wait_until="domcontentloaded", timeout=6000)
+            discovery.wait_for_timeout(700)
+            loaders = discovery.locator('script[src*="accelasearch.io"]').evaluate_all(
+                "els => els.map(e => e.src || '')"
+            )
+        except Exception:
+            loaders = []
+        finally:
+            discovery.close()
+        for loader in loaders:
+            match = re.match(r"(https://[^/]*accelasearch\.io/API/shops/[^/]+)/loader", loader, re.I)
+            if not match:
+                continue
+            try:
+                response = get(match.group(1)+"/search?"+urlencode({"q":code}))
+                data = response.json()
+                candidate = clean((data.get("header") or {}).get("urlPrefix"))
+            except Exception:
+                candidate = ""
+            if candidate and same_domain(candidate, base):
+                payload = browser_open_verified(ctx, candidate, base, code, "browser - AccelaSearch")
+                if payload:
+                    return payload
+
+        # Prima usa la form di ricerca reale scoperta nell'HTML: e piu
+        # rapida e precisa dei tentativi su percorsi generici.
+        for variant in code_variants(code):
+            if time.monotonic() >= deadline:
+                return None
+            for candidate in real_search_candidates(base, variant):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                payload = browser_open_verified(ctx, candidate, base, code, "browser - form sito")
+                if payload:
+                    return payload
+
+        routes = (
+            ("/search", "q"),
+            ("/catalogsearch/result/", "q"),
+            ("/cerca", "q"),
+            ("/", "s"),
+        )
+        for variant in code_variants(code):
+            for path, parameter in routes:
+                if time.monotonic() >= deadline:
+                    return None
+                search_url = urljoin(base.rstrip("/")+"/", path.lstrip("/"))
+                search_url += ("&" if "?" in search_url else "?") + urlencode({parameter: variant})
+                page = ctx.new_page()
+                try:
+                    remaining = max(1000, int((deadline-time.monotonic())*1000))
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=min(6000, remaining))
+                    page.wait_for_timeout(1600)
+                    payload = rendered_product_payload(page, code, "browser - ricerca diretta")
+                    if payload:
+                        cache_set(base, code, payload["url"], payload["title"])
+                        return payload
+                    candidates = browser_candidate_links(page, base, code)
+                except Exception:
+                    candidates = []
+                finally:
+                    page.close()
+                for candidate in candidates:
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    payload = browser_open_verified(ctx, candidate, base, code, "browser - ricerca diretta")
+                    if payload:
+                        return payload
+
+        for candidate in bing_rss_candidates(base, code):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            payload = browser_open_verified(ctx, candidate, base, code, "browser - Bing RSS")
+            if payload:
+                return payload
+    finally:
+        ctx.close()
+    return None
 
 # Normalizza e pulisce la stringa rimuovendo entità HTML, caratteri invisibili e convertendola in maiuscolo
 def normalize_source(value):
@@ -991,26 +1184,6 @@ def make_code_regex(code):
         re.IGNORECASE,
     )
 
-#controlla se il codice è presente nella pagina web o nell'URL
-def exact_code_present(soup, url, code):
-    rx = make_code_regex(code)
-    if rx is None:
-        return False
-
-    sources = [
-        url,
-        page_title(soup),
-        soup.get_text(" ", strip=True),
-
-        # Include attributi, script JSON e dati non visibili
-        soup.decode(),
-    ]
-
-    return any(
-        rx.search(normalize_source(source))
-        for source in sources
-        if source
-    )
 # ---------------- PRICE EXTRACTION ----------------
 
 #legge la pagina web ed estrae il testo di tutte le tabelle presenti
@@ -1067,129 +1240,63 @@ def _chunk(text, start_label, end_labels=(), max_len=5000):
             end = min(end, p)
     return text[pos:end]
 
-#estrae i prezzi neutri e personalizzati dal testo del sito Stampasi
-def parse_stampasi(text):
+#estrae i prezzi neutri e personalizzati dal testo dei siti
+def parse_generic(text):
+    """
+    Parser universale: estrae quantità e prezzi (neutri e personalizzati)
+    da qualsiasi layout di e-commerce senza regole per singolo sito.
+    """
     neutral, printed = {}, {}
-    block = _chunk(text, "TABELLA PREZZI CADAUNO", ("Calcola il tuo preventivo",), 3500)
-    if not block:
+    if not text:
         return neutral, printed
 
-    for q, n, p in re.findall(
-        r"(?<!\d)(\d{1,6})\s*€\s*(\d+[.,]\d{1,4})\s*€\s*(\d+[.,]\d{1,4})",
-        block
-    ):
-        neutral[str(int(q))] = parse_price(n)
-        printed[str(int(q))] = parse_price(p)
-
-    return neutral, printed
-
-#estrae i prezzi neutri e personalizzati dal testo del sito gadget365
-def parse_gadget365(text):
-    neutral, printed = {}, {}
-    block = _chunk(text, "Tabella prezzi", ("Dettagli del prodotto",), 3500)
-    if not block:
+    #riconosce tabelle a 3 colonne: Quantità | Prezzo Neutro | Prezzo Personalizzato
+    matches_dual = re.findall(
+        r"(?<!\d)(\d{1,6})\s*(?:pz|pezzi)?\s*[:\-\|]?\s*€?\s*(\d+[.,]\d{1,4})\s*€?\s*(?:\||/|\s)\s*€?\s*(\d+[.,]\d{1,4})\s*€?",
+        text, re.I
+    )
+    if matches_dual:
+        for q, n, p in matches_dual:
+            q_val = str(int(q))
+            neutral[q_val] = parse_price(n)
+            printed[q_val] = parse_price(p)
         return neutral, printed
 
-    m = re.search(
-        r"Prezzo con stampa.*?Quantità.*?\|\s*([0-9\s|]+?)\s*Quadricromia\s*\|\s*([0-9.,\s|]+?)\s*Prezzi indicativi",
-        block, re.I | re.S
-    )
-    if m:
-        qtys = [int(x) for x in re.findall(r"\d+", m.group(1))]
-        vals = [parse_price(x) for x in re.findall(r"\d+[.,]\d+", m.group(2))]
-        printed = _zip_prices(qtys, vals)
+    #se non trova la struttura unica, separa il testo tramite parole chiave di stampa
+    sections = re.split(r"(?:con stampa|personalizza|sublimazione|serigrafia|incisione)", text, flags=re.I)
+    
+    text_neutral = sections[0]
+    text_printed = sections[1] if len(sections) > 1 else ""
 
-    m = re.search(
-        r"Prezzo senza personalizzazione.*?Quantità\s*\|\s*([0-9\s|]+?)\s*Prezzo(?:\s*\[Input\])?\s*\|\s*([0-9.,\s|]+?)\s*Prezzi\s+IVA esclusa",
-        block, re.I | re.S
-    )
-    if m:
-        qtys = [int(x) for x in re.findall(r"\d+", m.group(1))]
-        vals = [parse_price(x) for x in re.findall(r"\d+[.,]\d+", m.group(2))]
-        neutral = _zip_prices(qtys, vals)
-
-    return neutral, printed
-
-#estrae i prezzi neutri e personalizzati dal testo del sito fullgadgets
-def parse_fullgadgets(text):
-    neutral, printed = {}, {}
-    block = _chunk(text, "Sconti sulla quantità", ("Caratteristiche",), 3000)
-    if not block:
-        return neutral, printed
-
-    m = re.search(
-        r"Quantità pz\s*\|\s*([0-9\s|]+?)\s*Prezzo senza stampa\s*\|\s*((?:€?\s*\d+[.,]\d+\s*\|?\s*)+?)\s*Posizione di stampa:",
-        block, re.I | re.S
-    )
-    if m:
-        qtys = [int(x) for x in re.findall(r"\d+", m.group(1))]
-        neutral = _zip_prices(qtys, _price_list(m.group(2)))
-
-        mp = re.search(
-            r"Transfer sublimazione\s*-\s*220x180mm\s*\|\s*((?:€?\s*\d+[.,]\d+\s*\|?\s*)+)",
+    def _extract_pairs(block):
+        res = {}
+        #estrae coppie: Quantità -> Prezzo
+        pairs = re.findall(
+            r"(?<!\d)(\d{1,6})(?:\s*-\s*\d+)?\s*(?:pz|pezzi)?\s*[:\-\|]?\s*€?\s*(\d+[.,]\d{1,4})\s*€?",
             block, re.I
         )
-        if mp:
-            printed = _zip_prices(qtys, _price_list(mp.group(1)))
+        for q, p in pairs:
+            val = parse_price(p)
+            if val is not None:
+                res[str(int(q))] = val
+        return res
 
-    return neutral, printed
-
-#estrae i prezzi neutri e personalizzati dal testo del sito mrbrando
-def parse_mrbrando(text):
-    neutral, printed = {}, {}
-    block = _chunk(text, "Prezzi per quantità e tipologia stampa", ("Richiedi Informazioni",), 2800)
-    if not block:
-        return neutral, printed
-
-    starts = [50, 100, 200, 500, 1000, 2500]
-
-    mn = re.search(
-        r"Senza stampa\s*\|\s*((?:€\s*\d+[.,]\d+\s*\|?\s*){6})",
-        block, re.I
-    )
-    mp = re.search(
-        r"(?:MOUSE PAD\s+)?Sublimazione\s*\|\s*((?:€\s*\d+[.,]\d+\s*\|?\s*){6})",
-        block, re.I
-    )
-    if mn:
-        neutral = _zip_prices(starts, _price_list(mn.group(1)))
-    if mp:
-        printed = _zip_prices(starts, _price_list(mp.group(1)))
-    return neutral, printed
-
-#estrae i prezzi neutri e personalizzati dal testo del sito wordans
-def parse_wordans(text):
-    neutral = {}
-    m = re.search(r"1-7\s+8-23\s+24-71\s+72-143\s+144-287\s+288\s*\+", text, re.I)
-    if not m:
-        return neutral, {}
-
-    tail = text[m.end():m.end()+1200]
-    vals = [parse_price(x) for x in re.findall(r"(\d+[.,]\d{1,2})\s*€", tail)]
-    vals = [v for v in vals if v is not None][:6]
-    if len(vals) == 6:
-        neutral = _zip_prices([1, 8, 24, 72, 144, 288], vals)
-    return neutral, {}
-
-#esrae i prezzi neutri e personalizzati dal testo del sito io ti stampo
-def parse_iotistampo(text):
-    neutral, printed = {}, {}
-    block = _chunk(text, "Tabella dei prezzi", ("Calcola preventivo",), 3500)
-    if not block:
-        return neutral, printed
-
-    m = re.search(
-        r"Quantità\s*\|\s*([0-9\s|]+?)\s*Prezzo senza stampa\s*\|\s*((?:€\s*\d+[.,]\d+\s*\|?\s*)+?)\s*Prezzo con stampa base\s*\|\s*((?:€\s*\d+[.,]\d+\s*\|?\s*)+)",
-        block, re.I | re.S
-    )
-    if m:
-        qtys = [int(x) for x in re.findall(r"\d+", m.group(1))]
-        neutral = _zip_prices(qtys, _price_list(m.group(2)))
-        printed = _zip_prices(qtys, _price_list(m.group(3)))
+    neutral = _extract_pairs(text_neutral)
+    if text_printed:
+        printed = _extract_pairs(text_printed)
 
     return neutral, printed
 
 #cerca ed estrae i prezzi da tabelle sconosciute o non standard nel sito
+def _merge_lowest(target, qtys, vals):
+    for quantity, value in zip(qtys, vals):
+        if value is None:
+            continue
+        key = str(int(quantity))
+        if key not in target or value < target[key]:
+            target[key] = value
+
+
 def parse_unknown_table(soup):
     neutral, printed = {}, {}
     for table in soup.find_all("table"):
@@ -1214,50 +1321,90 @@ def parse_unknown_table(soup):
         if not qtys:
             continue
 
+        table_neutral = any(x in low for x in (
+            "senza stampa", "senza personalizzazione", "non include stampa",
+            "unprinted", "without printing"
+        ))
+        table_printed = any(x in low for x in (
+            "con stampa", "personalizz", "printed", "printing"
+        ))
+
         for row in rows:
             if not row:
                 continue
             label = row[0].lower()
+            # Ignora intestazioni, righe verticali e duplicati responsive che
+            # contengono l'intera tabella in una singola riga.
+            if label.startswith(("quantit", "quantity", "qty")):
+                continue
+            if qty_start(row[0]) is not None:
+                continue
+            if len(row) > len(qtys) + 3:
+                continue
             vals = [parse_price(c) for c in row[1:]]
             vals = [v for v in vals if v is not None][:len(qtys)]
             if len(vals) < 2:
                 continue
-            if any(x in label for x in ("senza stampa", "senza personalizzazione", "unprinted", "without printing", "neutro")):
-                neutral.update(_zip_prices(qtys, vals))
-            elif any(x in label for x in ("con stampa", "personalizz", "printed", "sublim", "quadricromia")):
-                printed.update(_zip_prices(qtys, vals))
+            is_neutral = any(x in label for x in (
+                "senza stampa", "senza personalizzazione", "unprinted",
+                "without printing", "neutro"
+            )) or (table_neutral and label.strip() in ("prezzo", "price"))
+            is_printed = any(x in label for x in (
+                "con stampa", "personalizz", "printed", "sublim",
+                "quadricromia", "serigraf", "tampograf", "transfer",
+                "ricamo", "incision", "colore"
+            ))
+            if is_neutral:
+                _merge_lowest(neutral, qtys, vals)
+            elif is_printed:
+                _merge_lowest(printed, qtys, vals)
     return neutral, printed
+
+
+def parse_range_price_ladder(text):
+    """Legge listini del tipo 1-7, 8-23, 24-71 ... seguiti dai prezzi."""
+    sequence_rx = re.compile(
+        r"(?:(?<!\d)\d{1,6}\s*(?:-\s*\d{1,6}|\+)\s*){3,}",
+        re.I
+    )
+    for match in sequence_rx.finditer(text or ""):
+        quantities = [
+            int(value) for value in re.findall(
+                r"(?<!\d)(\d{1,6})\s*(?:-\s*\d{1,6}|\+)",
+                match.group(0)
+            )
+        ]
+        tail = (text or "")[match.end():match.end()+1000]
+        prices = [
+            parse_price(value) for value in re.findall(
+                r"(?<!\d)(\d{1,5}[.,]\d{2,4})\s*(?:€|EUR)",
+                tail,
+                re.I
+            )
+        ]
+        prices = [value for value in prices if value is not None]
+        if len(quantities) >= 3 and len(prices) >= len(quantities):
+            return _zip_prices(quantities, prices[:len(quantities)])
+    return {}
 
 #smista la pagina web al lettore del rispettivo sito per estrarre i prezzi corretti
 def parse_prices(base, soup, text):
-    d = domain(base)
+    neutral, printed=parse_unknown_table(soup)
+    source="Tabella esplicita del sito"
 
-    if d == "stampasi.it":
-        neutral, printed = parse_stampasi(text)
-        vat, source = "IVA esclusa", "Tabella reale StampaSi"
-    elif d == "gadget365.it":
-        neutral, printed = parse_gadget365(text)
-        vat, source = "IVA esclusa", "Tabella reale Gadget365"
-    elif d == "fullgadgets.com":
-        neutral, printed = parse_fullgadgets(text)
-        vat, source = "IVA inclusa", "Tabella reale FullGadgets"
-    elif d == "mrbrando.it":
-        neutral, printed = parse_mrbrando(text)
-        vat, source = "IVA esclusa", "Tabella reale MrBrando"
-    elif d == "wordans.it":
-        neutral, printed = parse_wordans(text)
-        vat, source = "IVA inclusa", "Fasce reali Wordans"
-    elif d == "iotistampo.it":
-        neutral, printed = parse_iotistampo(text)
-        vat, source = "IVA non verificata", "Tabella reale ioTISTAMPO"
-    else:
-        neutral, printed = parse_unknown_table(soup)
-        vat = (
-            "IVA esclusa" if re.search(r"iva\s+esclusa|without vat", text, re.I)
-            else "IVA inclusa" if re.search(r"iva\s+incl", text, re.I)
-            else "IVA non verificata"
-        )
-        source = "Tabella esplicita del sito"
+    if not neutral and not printed:
+        neutral = parse_range_price_ladder(text)
+        if neutral:
+            source = "Fasce quantita della pagina"
+        else:
+            neutral, printed = parse_generic(text)
+            source = "Prezzi estratti dal testo della pagina"
+
+    vat = (
+        "IVA esclusa" if re.search(r"iva\s+esclusa|without vat", text, re.I)
+        else "IVA inclusa" if re.search(r"iva\s+incl", text, re.I)
+        else "IVA non verificata"
+    )
 
     return {
         "neutral": neutral,
@@ -1318,7 +1465,10 @@ def run_sites(sites,code):
             if base:
                 try:
                     product = browser_resolve_exact(browser, base, code)
-                except:
+                    if not product:
+                        product = browser_force_resolve(browser, base, code)
+                except Exception as exc:
+                    print(f"Ricerca fallita su {base}: {type(exc).__name__}: {exc}")
                     product = None
             resolved.append((base, product))
     except:
@@ -1336,10 +1486,34 @@ def run_sites(sites,code):
         except:
             pass
 
-    return [
+    #salva il prodotto nel database
+    salva_prodotto(code, f"prodotto {code}")
+
+    #genera la lista dei risultati
+    risultati=[
         make_result(sites[i], resolved[i][0], resolved[i][1], code)
         for i in range(len(sites))
     ]
+    
+    #salva ogni match nel database
+    for res in risultati:
+        if not res.get("found"):
+            continue
+
+        prezzi = list((res.get("neutral") or {}).values())
+        prezzi += list((res.get("printed") or {}).values())
+
+        prezzo = min(prezzi) if prezzi else res.get("generic")
+
+        salva_match(
+            codice_prodotto=code,
+            nome_sito=res["site"],
+            prezzo=prezzo,
+            score=res.get("match_score", 0),
+            url_prodotto=res.get("product_url", "")
+        )
+
+    return risultati
 
 #reindirizza automaticamente chi apre il sito alla pagina principale
 @app.route("/")
@@ -1374,5 +1548,5 @@ def api_manual():
                     "price_sites":sum(r["verified_prices"] for r in results),"comparison":build_comparison(results),"results":results})
 
 if __name__=="__main__":
-    print("PriceMatch V12: http://127.0.0.1:5000")
+    print("PriceMatch V15: http://127.0.0.1:5000")
     app.run(host="127.0.0.1",port=5000,debug=False,threaded=True)
