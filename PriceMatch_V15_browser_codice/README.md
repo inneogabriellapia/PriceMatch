@@ -27,5 +27,23 @@ Se la ricerca interna fallisce:
 
 Questo privilegia l'accuratezza rispetto alla sola velocità.
 
-Avvio:
+Prima installazione:
+1. esegui INSTALLA_PRICEMATCH.bat;
+2. configura preferibilmente DATABASE_URL, SECRET_KEY e JWT_SECRET_KEY
+   come indicato in .env.example;
+3. verifica che PostgreSQL sia avviato.
+
+Avvio successivo:
 AVVIA_PRICEMATCH_V15.bat
+
+Sicurezza e funzionamento:
+- registrazione e login sono obbligatori;
+- le API browser richiedono sessione e token CSRF;
+- localhost, IP privati e protocolli diversi da HTTP/HTTPS non sono ammessi
+  nei siti personalizzati;
+- sono consentite al massimo 2 ricerche contemporanee per utente e 10 siti
+  per confronto manuale;
+- lo storico delle ricerche e salvato nella tabella PostgreSQL `ricerche`.
+
+Test:
+python -m unittest -v

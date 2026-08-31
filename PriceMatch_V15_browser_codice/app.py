@@ -1,15 +1,208 @@
-from flask import Flask, render_template, request, jsonify, redirect
+from flask import Flask, render_template, request, jsonify, redirect, session
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin, urlencode, quote_plus, unquote_plus
 from xml.etree import ElementTree
-from db import get_connection, salva_prodotto, salva_match
-import requests, re, json, os, concurrent.futures, sys, subprocess, threading, time
-import html
+from db import ensure_schema, salva_prodotto, salva_match, salva_ricerca, get_ricerca_precedente
+import requests, re, json, os, sys, subprocess, threading, time
+import ipaddress
+import logging
+import secrets
+import socket
 import tempfile
-import unicodedata
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache, wraps
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_jwt_extended import JWTManager, create_access_token
+from sqlalchemy.exc import IntegrityError
+from werkzeug.security import generate_password_hash, check_password_hash
+import uuid
 
 app = Flask(__name__)
+jobs = {}
+jobs_lock = threading.Lock()
+search_executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("SEARCH_WORKERS", "3"))))
+logger = logging.getLogger("pricematch")
+
+#configurazione Database e JWT
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://{user}:{password}@{host}:{port}/{database}".format(
+        user=os.environ.get("PGUSER", "postgres"),
+        password=os.environ.get("PGPASSWORD", "postgres"),
+        host=os.environ.get("PGHOST", "localhost"),
+        port=os.environ.get("PGPORT", "5432"),
+        database=os.environ.get("PGDATABASE", "postgres"),
+    ),
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config['JWT_SECRET_KEY'] = os.environ.get("JWT_SECRET_KEY") or app.config['SECRET_KEY']
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = "Strict"
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get("COOKIE_SECURE", "0") == "1"
+
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+jwt = JWTManager(app)
+
+
+def get_csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Autenticazione richiesta"}), 401
+            return redirect("/login")
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def csrf_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
+        expected = session.get("csrf_token")
+        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+            return jsonify({"error": "Token CSRF non valido"}), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def validate_code(value):
+    value = clean(value)
+    if not 2 <= len(value) <= 100:
+        raise ValueError("Il codice deve contenere da 2 a 100 caratteri")
+    if not re.fullmatch(r"[A-Za-z0-9._ /-]+", value):
+        raise ValueError("Il codice contiene caratteri non consentiti")
+    return value
+
+#tabella degli utenti
+class User(db.Model):
+    __tablename__ = 'utenti'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+#creazione utente
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    #se aperto da browser, mostra il modulo di registrazione
+    if request.method == 'GET':
+        return f'''
+        <div style="font-family: sans-serif; padding: 40px; text-align: center;">
+            <h2>Registrazione PriceMatch</h2>
+            <form action="/register" method="POST" style="display: inline-block; text-align: left;">
+                <input type="hidden" name="csrf_token" value="{get_csrf_token()}">
+                <p><input type="email" name="email" placeholder="Email" required style="width: 250px; padding: 8px;"></p>
+                <p><input type="password" name="password" placeholder="Password" required style="width: 250px; padding: 8px;"></p>
+                <button type="submit" style="width: 100%; padding: 10px; background: #28a745; color: white; border: none; cursor: pointer;">Registrati</button>
+            </form>
+            <p><a href="/login">Hai già un account? Accedi qui</a></p>
+        </div>
+        '''
+
+    #gestione dati inviati (sia Form HTML che JSON)
+    if request.form:
+        supplied = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(session.get("csrf_token", ""), supplied):
+            return jsonify({"error": "Token CSRF non valido"}), 403
+
+    data = request.get_json(silent=True) or request.form
+
+    email = clean(data.get('email')).lower()
+    password = data.get('password')
+
+    if not email or not password:
+        return jsonify({"error": "Email e password obbligatorie"}), 400
+    if len(email) > 120 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return jsonify({"error": "Indirizzo email non valido"}), 400
+    if len(password) < 10:
+        return jsonify({"error": "La password deve contenere almeno 10 caratteri"}), 400
+    if len(password) > 256:
+        return jsonify({"error": "La password e troppo lunga"}), 400
+
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email già registrata"}), 400
+
+    new_user = User(email=email)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Email gia registrata"}), 409
+
+    if request.form:
+        return redirect('/login')
+    return jsonify({"message": "Utente registrato con successo!"}), 201
+
+#aggiunge il login
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return f'''
+        <div style="font-family: sans-serif; padding: 40px; text-align: center;">
+            <h2>Login PriceMatch</h2>
+            <form action="/login" method="POST" style="display: inline-block; text-align: left;">
+                <input type="hidden" name="csrf_token" value="{get_csrf_token()}">
+                <p><input type="email" name="email" placeholder="Email" required style="width: 250px; padding: 8px;"></p>
+                <p><input type="password" name="password" placeholder="Password" required style="width: 250px; padding: 8px;"></p>
+                <button type="submit" style="width: 100%; padding: 10px; background: #0056b3; color: white; border: none; cursor: pointer;">Accedi</button>
+            </form>
+            <p style="margin-top: 15px;"><a href="/register">Non hai un account? Registrati qui</a></p>
+        </div>
+        '''
+
+    #legge i dati inviati dal Form HTML oppure via JSON
+    if request.form:
+        supplied = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(session.get("csrf_token", ""), supplied):
+            return jsonify({"error": "Token CSRF non valido"}), 403
+
+    data = request.form if request.form else (request.get_json(silent=True) or {})
+
+    email = clean(data.get('email')).lower()
+    password = data.get('password') or ""
+    user = User.query.filter_by(email=email).first()
+
+    if user and user.check_password(password):
+        #se l'accesso avviene da browser via Form HTML, reindirizza alla dashboard
+        if request.form:
+            session.clear()
+            session["user_id"] = user.id
+            get_csrf_token()
+            return redirect('/automatico')
+
+        #se l'accesso avviene via API (Postman / fetch JS), restituisce il token JWT
+        access_token = create_access_token(identity=str(user.id))
+        return jsonify({"token": access_token}), 200
+
+    return "Credenziali non valide", 401
+
+
+@app.route('/logout', methods=['POST'])
+@login_required
+@csrf_required
+def logout():
+    session.clear()
+    return redirect('/login')
+
 
 ROOT = os.path.dirname(__file__)
 CACHE_FILE = os.path.join(ROOT, "product_cache.json")
@@ -29,29 +222,179 @@ _install_attempted = False
 def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 def norm_code(x): return re.sub(r"[^A-Z0-9]","",str(x or "").upper())
 
+JOB_TTL_SECONDS = 3600
+MAX_JOBS = 100
+MAX_ACTIVE_JOBS_PER_USER = 2
+
+
+def _cleanup_jobs():
+    cutoff = time.time() - JOB_TTL_SECONDS
+    removable = sorted(
+        (
+            (task_id, job.get("updated_at", 0))
+            for task_id, job in jobs.items()
+            if job.get("status") in {"completed", "failed"}
+            and job.get("updated_at", 0) < cutoff
+        ),
+        key=lambda item: item[1],
+    )
+    for task_id, _ in removable:
+        jobs.pop(task_id, None)
+    while len(jobs) >= MAX_JOBS:
+        finished = [
+            (task_id, job.get("updated_at", 0))
+            for task_id, job in jobs.items()
+            if job.get("status") in {"completed", "failed"}
+        ]
+        if not finished:
+            break
+        jobs.pop(min(finished, key=lambda item: item[1])[0], None)
+
+
+def avvia_scraping_siti(codice):
+    results = run_sites(load_sites(), codice)
+    return {
+        "code": codice,
+        "found_sites": sum(bool(result.get("found")) for result in results),
+        "total_sites": len(results),
+        "price_sites": sum(bool(result.get("verified_prices")) for result in results),
+        "results": results,
+        "comparison": build_comparison(results),
+    }
+
+
+def search_worker(task_id, query, user_id):
+    with jobs_lock:
+        if task_id not in jobs:
+            return
+        jobs[task_id].update(status="running", updated_at=time.time())
+    try:
+        result = avvia_scraping_siti(query)
+        result["status"] = "completed"
+        try:
+            salva_ricerca(user_id, query, result)
+        except Exception:
+            logger.exception("Impossibile salvare lo storico della ricerca %s", query)
+        with jobs_lock:
+            jobs[task_id] = {
+                **result,
+                "user_id": user_id,
+                "updated_at": time.time(),
+            }
+    except Exception as exc:
+        logger.exception("Ricerca fallita per %s", query)
+        with jobs_lock:
+            jobs[task_id] = {
+                "status": "failed",
+                "error": str(exc),
+                "user_id": user_id,
+                "updated_at": time.time(),
+            }
+
+
+@app.route('/api/search', methods=['POST'])
+@login_required
+@csrf_required
+def start_search():
+    data = request.get_json(silent=True) or {}
+    try:
+        query = validate_code(data.get('query'))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    user_id = int(session["user_id"])
+    with jobs_lock:
+        _cleanup_jobs()
+        active = sum(
+            job.get("user_id") == user_id and job.get("status") in {"pending", "running"}
+            for job in jobs.values()
+        )
+        if active >= MAX_ACTIVE_JOBS_PER_USER:
+            return jsonify({'error': 'Hai gia due ricerche in corso'}), 429
+        task_id = str(uuid.uuid4())
+        jobs[task_id] = {
+            'status': 'pending',
+            'user_id': user_id,
+            'updated_at': time.time(),
+        }
+
+    search_executor.submit(search_worker, task_id, query, user_id)
+    return jsonify({'task_id': task_id}), 202
+
+#restituisce lo stato attuale o i risultati della ricerca tramite task_id
+@app.route('/api/search/status/<task_id>', methods=['GET'])
+@login_required
+def check_status(task_id):
+    with jobs_lock:
+        job = dict(jobs.get(task_id) or {})
+    if not job or job.get("user_id") != int(session["user_id"]):
+        return jsonify({'status': 'failed', 'error': 'Task non trovato'}), 404
+    job.pop("user_id", None)
+    job.pop("updated_at", None)
+    return jsonify(job)
+
 def load_sites():
     with open(os.path.join(ROOT,"sites.json"),"r",encoding="utf-8") as f:
         return json.load(f)
 
-#verifica l'URL, aggiunge http/https se mancano
-def normalize_base(url):
-    url=clean(url)
-    if not url:return None
-    if not url.startswith(("http://","https://")): url="https://"+url
+#verifica l'URL e impedisce accessi a localhost o reti private
+@lru_cache(maxsize=512)
+def hostname_is_public(hostname):
     try:
-        p=urlparse(url)
-        return f"{p.scheme}://{p.netloc}" if p.netloc else None
-    except:return None
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror:
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+        if not ip.is_global:
+            return False
+    return True
+
+
+def normalize_base(url):
+    url = clean(url)
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None
+        if not parsed.hostname or parsed.username or parsed.password:
+            return None
+        if not hostname_is_public(parsed.hostname.lower()):
+            return None
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
+    except (TypeError, ValueError):
+        return None
 
 #estrae il dominio dall'URL e rimuove il prefisso www
 def domain(url):
-    try:return urlparse(url).netloc.lower().replace("www.","")
+    try:return (urlparse(url).hostname or "").lower().removeprefix("www.")
     except:return ""
 
 #verifica se due URL appartengono allo stesso dominio o a un sotto-dominio
 def same_domain(url,base):
     a,b=domain(url),domain(base)
     return bool(a and b and (a==b or a.endswith("."+b)))
+
+
+def is_safe_public_url(url):
+    try:
+        parsed = urlparse(clean(url))
+        return bool(
+            parsed.scheme.lower() in {"http", "https"}
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and hostname_is_public(parsed.hostname.lower())
+        )
+    except (TypeError, ValueError):
+        return False
 
 #controlla se l'URL inserito corrisponde alla home page
 def is_home(url):
@@ -65,9 +408,39 @@ def is_listing(url):
     low=(url or "").lower()
     return any(x in low for x in ("/search","catalogsearch","/cerca","?q=","&q=","?s=","&s=","/ricerca","/results"))
 
-#scarica il contenuto della pagina web dall'URL fornito
+#scarica una pagina controllando anche ogni destinazione di redirect
+def request_url(method, url, **kwargs):
+    current = clean(url)
+    current_method = method.upper()
+    data = kwargs.pop("data", None)
+    for _ in range(6):
+        if not is_safe_public_url(current):
+            raise ValueError("URL non pubblico o non consentito")
+        response = requests.request(
+            current_method,
+            current,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+            data=data if current_method == "POST" else None,
+            **kwargs,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            return response
+        current = urljoin(current, location)
+        if response.status_code == 303 or (
+            response.status_code in {301, 302} and current_method == "POST"
+        ):
+            current_method = "GET"
+            data = None
+    raise requests.TooManyRedirects("Troppi redirect")
+
+
 def get(url):
-    return requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+    return request_url("GET", url)
 
 #estrae e pulisce il prezzo numerico da un testo generico
 def parse_price(raw):
@@ -79,8 +452,14 @@ def parse_price(raw):
 
     s = clean(raw).replace("\xa0", " ").strip()
 
-    #rende opzionale la parte decimale e supporta interi
-    m = re.search(r"(?<!\d)(\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{1,4})?|\d{1,6}(?:[.,]\d{1,4})?|\d{1,6})(?!\d)", s)
+    number = r"\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{1,4})?|\d{1,6}(?:[.,]\d{1,4})?|\d{1,6}"
+    patterns = (
+        rf"(?:prezzo|price|costo|cost)\s*(?:unitario|cad\.?|:){{0,1}}\s*(?:€|eur)?\s*({number})",
+        rf"(?:€|eur)\s*({number})(?![A-Za-z0-9])",
+        rf"(?<![A-Za-z0-9])({number})\s*(?:€|eur)\b",
+        rf"(?<![A-Za-z0-9])({number})(?![A-Za-z0-9])",
+    )
+    m = next((match for pattern in patterns if (match := re.search(pattern, s, re.I))), None)
     if not m:
         return None
 
@@ -247,24 +626,6 @@ def enhanced_search_query(base, code, fingerprint=None):
     return " ".join(parts)
 
 
-#salva i risultati del match in postgres
-def salva_il_match(prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto):
-    try:
-        conn = get_connection()  #la funzione di connessione
-        cur = conn.cursor()
-
-        query = """
-            INSERT INTO risultati_match 
-            (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto, data_rilevazione)
-            VALUES (%s, %s, %s, %s, %s, NOW());
-        """
-        cur.execute(query, (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto))
-        
-        conn.commit()  #senza questo Postgres annulla l'inserimento!
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Errore durante il salvataggio su DB: {e}")
 # ---------------- CACHE ----------------
 
 #previene la corruzione del file di cache
@@ -278,8 +639,6 @@ def safe_save_json(filepath, data):
     os.replace(temp_name, filepath)
 
 #legge e carica in memoria tutti i dati salvati nel file della cache
-PENDING_CACHE_FILE = os.path.join(ROOT, "product_cache_pending.json")
-
 def cache_load():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -316,6 +675,37 @@ def cache_delete(base,code):
             except OSError:
                 pass
 
+#controlla se esite già una ricerca completa per la query richiesta
+@app.route('/api/search/check', methods=['GET'])
+@login_required
+def check_search_exists():
+    try:
+        query = validate_code(request.args.get('query')).upper()
+        previous = get_ricerca_precedente(int(session["user_id"]), query)
+    except ValueError:
+        return jsonify({"has_previous": False})
+    except Exception:
+        logger.exception("Errore durante la lettura dello storico")
+        return jsonify({"error": "Storico temporaneamente non disponibile"}), 503
+    return jsonify({"has_previous": previous is not None})
+
+#restituisce imediatamente i risultati della ricerca precedente
+@app.route('/api/search/previous', methods=['GET'])
+@login_required
+def get_previous_search():
+    try:
+        query = validate_code(request.args.get('query')).upper()
+        previous = get_ricerca_precedente(int(session["user_id"]), query)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        logger.exception("Errore durante la lettura dello storico")
+        return jsonify({"error": "Storico temporaneamente non disponibile"}), 503
+    if previous is not None:
+        return jsonify(previous)
+    return jsonify({"error": "Nessuna ricerca precedente trovata"}), 404
+
+#aggiornamento del worker in background per salavre l'ultimo risultato ottenuto
 # ---------------- PRODUCT VERIFICATION ----------------
 
 #controlla se il codice è presente nell'URl, nel titolo o nel testo del sito
@@ -415,17 +805,21 @@ def exact_code_present(soup, url, code):
     # I contenuti JSON-LD non sono sempre inclusi da soup.get_text()
     for script in soup.select('script[type*="ld+json"]'):
         script_text = script.string or script.get_text(" ", strip=True)
-        if script_text and rx.search(script_text):
+        if script_text and re.search(
+            rf'"(?:sku|mpn|productID)"\s*:\s*"[^"]*{rx.pattern}[^"]*"',
+            script_text,
+            re.IGNORECASE,
+        ):
             return True
 
-    # Fallback sul testo visibile
-    return bool(rx.search(text))
+    return False
 
 #scarica una pagina e verifica se è valida, se è la home o se contiene il codice cercato
 def verify_url(base,url,code):
     try:
         r=get(url)
         if not r.ok or "html" not in (r.headers.get("content-type") or "").lower():return None
+        if not same_domain(r.url, base):return None
         if is_home(r.url) or is_listing(r.url):return None
         soup=BeautifulSoup(r.text,"html.parser")
         if not exact_code_present(soup,r.url,code):return None
@@ -483,7 +877,7 @@ def real_search_candidates(base,code):
                 forms.append(((form.get("method") or "get").lower(),urljoin(base,form.get("action") or base),best[1]))
         for method,url,param in forms[:4]:
             try:
-                rr=requests.post(url,data={param:code},headers=HEADERS,timeout=TIMEOUT,allow_redirects=True) if method=="post" else get(url+("&" if "?" in url else "?")+urlencode({param:code}))
+                rr=request_url("POST",url,data={param:code}) if method=="post" else get(url+("&" if "?" in url else "?")+urlencode({param:code}))
                 out.extend(extract_links(rr,base,code,allow_price_cards=True))
             except:pass
     except:pass
@@ -761,11 +1155,20 @@ def rendered_code_present(page, code):
         body = clean(page.locator("body").inner_text(timeout=5000))
     except:
         body = ""
-    hay = f"{page.url} {title} {body}"
+    hay = f"{page.url} {title}"
 
     for variant in code_variants(code):
         if re.search(rf"(?<![A-Z0-9]){re.escape(variant)}(?![A-Z0-9])", hay, re.I):
             return True
+
+    rx = rx_code(code)
+    if rx and re.search(
+        rf"\b(?:cod(?:ice)?|sku|mpn|ref(?:erence)?|art(?:icolo)?|product\s*code)\b"
+        rf"[\s:#=\-]{{0,20}}{rx.pattern}",
+        body,
+        re.IGNORECASE,
+    ):
+        return True
 
     # Structured DOM attributes.
     selectors = [
@@ -796,10 +1199,10 @@ def rendered_code_present(page, code):
     return False
 
 #raccoglie tutti i dati verificati della pagina e crea la scheda finale del prodotto
-def rendered_product_payload(page, code, source):
+def rendered_product_payload(page, code, source, base=None):
     if is_home(page.url) or is_listing(page.url):
         return None
-    if not rendered_code_present(page, code):
+    if base and not same_domain(page.url, base):
         return None
 
     try:
@@ -807,6 +1210,8 @@ def rendered_product_payload(page, code, source):
     except:
         return None
     soup = BeautifulSoup(html, "html.parser")
+    if not exact_code_present(soup, page.url, code):
+        return None
     text = browser_body(page)
     title = browser_title(page) or page_title(soup) or code
 
@@ -911,7 +1316,7 @@ def browser_open_verified(ctx, url, base, code, source):
             page.wait_for_load_state("networkidle", timeout=3500)
         except:
             page.wait_for_timeout(700)
-        payload = rendered_product_payload(page, code, source)
+        payload = rendered_product_payload(page, code, source, base)
         if payload:
             cache_set(base, code, payload["url"], payload["title"])
             return payload
@@ -983,7 +1388,7 @@ def browser_resolve_exact(browser, base, code):
                         page.wait_for_timeout(900)
 
                         # Some sites redirect directly to the product.
-                        payload = rendered_product_payload(page, code, "browser - ricerca interna")
+                        payload = rendered_product_payload(page, code, "browser - ricerca interna", base)
                         if payload:
                             cache_set(base, code, payload["url"], payload["title"])
                             return payload
@@ -1127,7 +1532,7 @@ def browser_force_resolve(browser, base, code):
                     remaining = max(1000, int((deadline-time.monotonic())*1000))
                     page.goto(search_url, wait_until="domcontentloaded", timeout=min(6000, remaining))
                     page.wait_for_timeout(1600)
-                    payload = rendered_product_payload(page, code, "browser - ricerca diretta")
+                    payload = rendered_product_payload(page, code, "browser - ricerca diretta", base)
                     if payload:
                         cache_set(base, code, payload["url"], payload["title"])
                         return payload
@@ -1157,13 +1562,7 @@ def browser_force_resolve(browser, base, code):
 
 # Normalizza e pulisce la stringa rimuovendo entità HTML, caratteri invisibili e convertendola in maiuscolo
 def normalize_source(value):
-    value = html.unescape(unquote_plus(str(value or "")))
-    value = unicodedata.normalize("NFKC", value)
-
-    # Rimuove caratteri invisibili che possono spezzare il codice
-    value = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", value)
-
-    return value.upper()
+    return unquote_plus(str(value or "")).upper()
 
 #cerca il codice anche se ci sono spazi, punti o trattini
 def make_code_regex(code):
@@ -1455,6 +1854,7 @@ def run_sites(sites,code):
     V15: browser-first. No product name is required from the user.
     A single Chromium instance is reused across all ecommerce sites.
     """
+    code = validate_code(code).upper()
     resolved = []
     pw = browser = None
     try:
@@ -1486,18 +1886,26 @@ def run_sites(sites,code):
         except:
             pass
 
-    #salva il prodotto nel database
-    salva_prodotto(code, f"prodotto {code}")
+    # Il confronto deve restare disponibile anche se il DB e temporaneamente offline.
+    database_ready = True
+    try:
+        salva_prodotto(code, f"prodotto {code}")
+    except Exception:
+        database_ready = False
+        logger.exception("Impossibile salvare il prodotto %s", code)
 
     #genera la lista dei risultati
     risultati=[
         make_result(sites[i], resolved[i][0], resolved[i][1], code)
         for i in range(len(sites))
     ]
+    for index, result in enumerate(risultati):
+        if resolved[index][0] is None:
+            result["status"] = "URL non valido, non raggiungibile o non pubblico"
     
     #salva ogni match nel database
     for res in risultati:
-        if not res.get("found"):
+        if not database_ready or not res.get("found"):
             continue
 
         prezzi = list((res.get("neutral") or {}).values())
@@ -1505,13 +1913,17 @@ def run_sites(sites,code):
 
         prezzo = min(prezzi) if prezzi else res.get("generic")
 
-        salva_match(
-            codice_prodotto=code,
-            nome_sito=res["site"],
-            prezzo=prezzo,
-            score=res.get("match_score", 0),
-            url_prodotto=res.get("product_url", "")
-        )
+        try:
+            salva_match(
+                codice_prodotto=code,
+                nome_sito=res["site"],
+                prezzo=prezzo,
+                score=res.get("match_score", 0),
+                url_prodotto=res.get("product_url", ""),
+                url_base=res.get("base"),
+            )
+        except Exception:
+            logger.exception("Impossibile salvare il match per %s", res["site"])
 
     return risultati
 
@@ -1519,34 +1931,53 @@ def run_sites(sites,code):
 @app.route("/")
 
 #mostra la pagina web corretta caricando il rispettivo file html
-def root():return redirect("/automatico")
+def root():return redirect("/automatico" if session.get("user_id") else "/login")
 @app.route("/automatico")
-def automatico():return render_template("automatico.html")
+@login_required
+def automatico():return render_template("automatico.html", csrf_token=get_csrf_token())
 
 #riceve il codice prodotto e restituisce i risultati della ricerca automatica in JSON
 @app.route("/manuale")
-def manuale():return render_template("manuale.html")
+@login_required
+def manuale():return render_template("manuale.html", csrf_token=get_csrf_token())
 
 #riceve il codice e la lista di siti dall'utente e restituisce i risultati in JSON 
 @app.route("/api/automatico")
+@login_required
 def api_auto():
-    code=clean(request.args.get("code"))
-    if not code:return jsonify({"error":"Inserisci un codice valido"}),400
+    try:code=validate_code(request.args.get("code"))
+    except ValueError as exc:return jsonify({"error":str(exc)}),400
     results=run_sites(load_sites(),code)
     return jsonify({"code":code,"total_sites":len(results),"found_sites":sum(r["found"] for r in results),
                     "price_sites":sum(r["verified_prices"] for r in results),"comparison":build_comparison(results),"results":results})
 
 #avvia ufficialmente l'applicazione web impostando l'indirizzo locale e la porta
 @app.route("/api/manuale",methods=["POST"])
+@login_required
+@csrf_required
 def api_manual():
-    data=request.get_json(silent=True) or {};code=clean(data.get("code"));sites=data.get("sites") or []
-    if not code:return jsonify({"error":"Inserisci un codice valido"}),400
-    sites=[{"name":clean(x.get("name")),"url":clean(x.get("url"))} for x in sites[:30] if isinstance(x,dict) and clean(x.get("url"))]
+    data=request.get_json(silent=True) or {}
+    try:code=validate_code(data.get("code"))
+    except ValueError as exc:return jsonify({"error":str(exc)}),400
+    raw_sites=data.get("sites") or []
+    sites=[]
+    for item in raw_sites[:10]:
+        if not isinstance(item,dict) or not clean(item.get("url")):
+            continue
+        base=normalize_base(item.get("url"))
+        if not base:
+            return jsonify({"error":f"URL non valido o non pubblico: {clean(item.get('url'))}"}),400
+        sites.append({"name":clean(item.get("name"))[:120],"url":base})
     if not sites:return jsonify({"error":"Inserisci almeno un sito"}),400
     results=run_sites(sites,code)
     return jsonify({"code":code,"total_sites":len(results),"found_sites":sum(r["found"] for r in results),
                     "price_sites":sum(r["verified_prices"] for r in results),"comparison":build_comparison(results),"results":results})
 
 if __name__=="__main__":
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+    try:
+        ensure_schema()
+    except Exception:
+        logger.exception("Database non disponibile: i risultati non saranno persistiti")
     print("PriceMatch V15: http://127.0.0.1:5000")
     app.run(host="127.0.0.1",port=5000,debug=False,threaded=True)

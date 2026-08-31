@@ -4,3 +4,6 @@ beautifulsoup4==4.12.3
 lxml==5.3.0
 playwright==1.55.0
 psycopg2-binary==2.9.12
+Flask-SQLAlchemy==3.1.1
+Flask-Migrate==4.1.0
+Flask-JWT-Extended==4.7.4
