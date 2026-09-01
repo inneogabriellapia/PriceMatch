@@ -2,57 +2,93 @@ from flask import Flask, render_template, request, jsonify, redirect, session
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin, urlencode, quote_plus, unquote_plus
 from xml.etree import ElementTree
-from db import ensure_schema, salva_prodotto, salva_match, salva_ricerca, get_ricerca_precedente
-import requests, re, json, os, sys, subprocess, threading, time
+from db import get_connection, get_match_precedenti, get_ricerca_precedente, get_ricerche_recenti, salva_match, salva_prodotto, salva_ricerca
+import requests, re, json, os, concurrent.futures, sys, subprocess, threading, time
+import html
 import ipaddress
 import logging
 import secrets
 import socket
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import unicodedata
+from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_jwt_extended import JWTManager, create_access_token
-from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 import uuid
 
 app = Flask(__name__)
-jobs = {}
-jobs_lock = threading.Lock()
-search_executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("SEARCH_WORKERS", "3"))))
-logger = logging.getLogger("pricematch")
-
-#configurazione Database e JWT
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://{user}:{password}@{host}:{port}/{database}".format(
-        user=os.environ.get("PGUSER", "postgres"),
-        password=os.environ.get("PGPASSWORD", "postgres"),
-        host=os.environ.get("PGHOST", "localhost"),
-        port=os.environ.get("PGPORT", "5432"),
-        database=os.environ.get("PGDATABASE", "postgres"),
-    ),
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY", "dev-only-change-me"),
+    JWT_SECRET_KEY=os.environ.get("JWT_SECRET_KEY", os.environ.get("SECRET_KEY", "dev-only-change-me")),
+    SQLALCHEMY_DATABASE_URI=os.environ.get("DATABASE_URL", "sqlite:///database.db"),
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
 )
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config['JWT_SECRET_KEY'] = os.environ.get("JWT_SECRET_KEY") or app.config['SECRET_KEY']
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = "Strict"
-app.config['SESSION_COOKIE_SECURE'] = os.environ.get("COOKIE_SECURE", "0") == "1"
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+jobs = {}
+saved_searches = {}
+_jobs_lock = threading.Lock()
+_active_searches = {}
+search_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("SEARCH_WORKERS", "3"))),
+    thread_name_prefix="pricematch",
+)
+
+@app.route('/')
+def home():
+    if not session.get('user_id'):
+        return redirect('/login')
+    return render_template('home.html', dashboard=build_dashboard(session['user_id']))
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
 
+#tabella degli utenti
+class User(db.Model):
+    __tablename__ = 'utenti'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
 
-def get_csrf_token():
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class SearchHistory(db.Model):
+    __tablename__ = 'storico_ricerche_locale'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('utenti.id', ondelete='CASCADE'), nullable=False)
+    code = db.Column(db.String(100), nullable=False)
+    result = db.Column(db.JSON, nullable=False)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (db.UniqueConstraint('user_id', 'code', name='uq_storico_utente_codice'),)
+
+
+with app.app_context():
+    db.create_all()
+
+
+def _csrf_token():
     token = session.get("csrf_token")
     if not token:
         token = secrets.token_urlsafe(32)
         session["csrf_token"] = token
     return token
+
+
+@app.context_processor
+def inject_csrf_token():
+    return {"csrf_token": _csrf_token()}
 
 
 def login_required(view):
@@ -69,45 +105,22 @@ def login_required(view):
 def csrf_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
         expected = session.get("csrf_token")
+        supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
         if not expected or not supplied or not secrets.compare_digest(expected, supplied):
             return jsonify({"error": "Token CSRF non valido"}), 403
         return view(*args, **kwargs)
     return wrapped
-
-
-def validate_code(value):
-    value = clean(value)
-    if not 2 <= len(value) <= 100:
-        raise ValueError("Il codice deve contenere da 2 a 100 caratteri")
-    if not re.fullmatch(r"[A-Za-z0-9._ /-]+", value):
-        raise ValueError("Il codice contiene caratteri non consentiti")
-    return value
-
-#tabella degli utenti
-class User(db.Model):
-    __tablename__ = 'utenti'
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
 
 #creazione utente
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     #se aperto da browser, mostra il modulo di registrazione
     if request.method == 'GET':
-        return f'''
+        return '''
         <div style="font-family: sans-serif; padding: 40px; text-align: center;">
             <h2>Registrazione PriceMatch</h2>
             <form action="/register" method="POST" style="display: inline-block; text-align: left;">
-                <input type="hidden" name="csrf_token" value="{get_csrf_token()}">
                 <p><input type="email" name="email" placeholder="Email" required style="width: 250px; padding: 8px;"></p>
                 <p><input type="password" name="password" placeholder="Password" required style="width: 250px; padding: 8px;"></p>
                 <button type="submit" style="width: 100%; padding: 10px; background: #28a745; color: white; border: none; cursor: pointer;">Registrati</button>
@@ -117,11 +130,6 @@ def register():
         '''
 
     #gestione dati inviati (sia Form HTML che JSON)
-    if request.form:
-        supplied = request.form.get("csrf_token", "")
-        if not secrets.compare_digest(session.get("csrf_token", ""), supplied):
-            return jsonify({"error": "Token CSRF non valido"}), 403
-
     data = request.get_json(silent=True) or request.form
 
     email = clean(data.get('email')).lower()
@@ -129,12 +137,6 @@ def register():
 
     if not email or not password:
         return jsonify({"error": "Email e password obbligatorie"}), 400
-    if len(email) > 120 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        return jsonify({"error": "Indirizzo email non valido"}), 400
-    if len(password) < 10:
-        return jsonify({"error": "La password deve contenere almeno 10 caratteri"}), 400
-    if len(password) > 256:
-        return jsonify({"error": "La password e troppo lunga"}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email già registrata"}), 400
@@ -142,25 +144,18 @@ def register():
     new_user = User(email=email)
     new_user.set_password(password)
     db.session.add(new_user)
-    try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-        return jsonify({"error": "Email gia registrata"}), 409
+    db.session.commit()
 
-    if request.form:
-        return redirect('/login')
     return jsonify({"message": "Utente registrato con successo!"}), 201
 
 #aggiunge il login
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET':
-        return f'''
+        return '''
         <div style="font-family: sans-serif; padding: 40px; text-align: center;">
             <h2>Login PriceMatch</h2>
             <form action="/login" method="POST" style="display: inline-block; text-align: left;">
-                <input type="hidden" name="csrf_token" value="{get_csrf_token()}">
                 <p><input type="email" name="email" placeholder="Email" required style="width: 250px; padding: 8px;"></p>
                 <p><input type="password" name="password" placeholder="Password" required style="width: 250px; padding: 8px;"></p>
                 <button type="submit" style="width: 100%; padding: 10px; background: #0056b3; color: white; border: none; cursor: pointer;">Accedi</button>
@@ -169,30 +164,23 @@ def login():
         </div>
         '''
 
-    #legge i dati inviati dal Form HTML oppure via JSON
-    if request.form:
-        supplied = request.form.get("csrf_token", "")
-        if not secrets.compare_digest(session.get("csrf_token", ""), supplied):
-            return jsonify({"error": "Token CSRF non valido"}), 403
-
     data = request.form if request.form else (request.get_json(silent=True) or {})
-
     email = clean(data.get('email')).lower()
     password = data.get('password') or ""
     user = User.query.filter_by(email=email).first()
 
     if user and user.check_password(password):
-        #se l'accesso avviene da browser via Form HTML, reindirizza alla dashboard
-        if request.form:
-            session.clear()
-            session["user_id"] = user.id
-            get_csrf_token()
-            return redirect('/automatico')
+        session["user_id"] = user.id
+        _csrf_token()
+        if request.is_json:
+            return jsonify({
+                "token": create_access_token(identity=str(user.id)),
+                "csrf_token": session["csrf_token"],
+            })
+        return redirect("/")
 
-        #se l'accesso avviene via API (Postman / fetch JS), restituisce il token JWT
-        access_token = create_access_token(identity=str(user.id))
-        return jsonify({"token": access_token}), 200
-
+    if request.is_json:
+        return jsonify({"error": "Credenziali non valide"}), 401
     return "Credenziali non valide", 401
 
 
@@ -202,6 +190,60 @@ def login():
 def logout():
     session.clear()
     return redirect('/login')
+
+@app.route('/compagnie', methods=['GET', 'POST'])
+@login_required
+def compagnie():
+    message = None
+    error = None
+    if request.method == 'POST':
+        expected = session.get('csrf_token')
+        supplied = request.form.get('csrf_token')
+        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+            return jsonify({"error": "Token CSRF non valido"}), 403
+        name = clean(request.form.get('name'))
+        url = clean(request.form.get('url'))
+        if not name or not url:
+            error = "Inserisci sia il nome sia l'indirizzo del sito."
+        elif len(name) > 120 or len(url) > 500:
+            error = "Nome o indirizzo troppo lungo."
+        elif not is_safe_public_url(url):
+            error = "Inserisci un URL pubblico valido che inizi con http:// o https://."
+        else:
+            normalized = normalize_base(url)
+            companies = load_sites()
+            duplicate = any(
+                company['name'].lower() == name.lower()
+                or domain(company['url']) == domain(normalized)
+                for company in companies
+            )
+            if duplicate:
+                error = "Questa compagnia è già presente."
+            else:
+                companies.append({"name": name, "url": normalized})
+                try:
+                    with _cache_lock:
+                        safe_save_json(os.path.join(ROOT, 'sites.json'), companies)
+                    message = "Compagnia aggiunta correttamente."
+                except OSError:
+                    logger.exception("Salvataggio compagnia non riuscito")
+                    error = "Non è stato possibile salvare la compagnia."
+    return render_template('compagnie.html', companies=load_sites(), message=message, error=error)
+
+@app.route('/monitorati')
+@login_required
+def monitorati():
+    return render_template('monitorati.html')
+
+@app.route('/personalizzati')
+@login_required
+def personalizzati():
+    return render_template('personalizzati.html')
+
+@app.route('/statistiche-dettaglio')
+@login_required
+def statistiche_dettaglio():
+    return "<h1>Statistiche Ingrandite</h1><p>Grafici a schermo intero.</p>"
 
 
 ROOT = os.path.dirname(__file__)
@@ -222,74 +264,46 @@ _install_attempted = False
 def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 def norm_code(x): return re.sub(r"[^A-Z0-9]","",str(x or "").upper())
 
-JOB_TTL_SECONDS = 3600
-MAX_JOBS = 100
-MAX_ACTIVE_JOBS_PER_USER = 2
-
-
-def _cleanup_jobs():
-    cutoff = time.time() - JOB_TTL_SECONDS
-    removable = sorted(
-        (
-            (task_id, job.get("updated_at", 0))
-            for task_id, job in jobs.items()
-            if job.get("status") in {"completed", "failed"}
-            and job.get("updated_at", 0) < cutoff
-        ),
-        key=lambda item: item[1],
-    )
-    for task_id, _ in removable:
-        jobs.pop(task_id, None)
-    while len(jobs) >= MAX_JOBS:
-        finished = [
-            (task_id, job.get("updated_at", 0))
-            for task_id, job in jobs.items()
-            if job.get("status") in {"completed", "failed"}
-        ]
-        if not finished:
-            break
-        jobs.pop(min(finished, key=lambda item: item[1])[0], None)
-
-
-def avvia_scraping_siti(codice):
-    results = run_sites(load_sites(), codice)
-    return {
-        "code": codice,
-        "found_sites": sum(bool(result.get("found")) for result in results),
-        "total_sites": len(results),
-        "price_sites": sum(bool(result.get("verified_prices")) for result in results),
-        "results": results,
-        "comparison": build_comparison(results),
-    }
-
-
-def search_worker(task_id, query, user_id):
-    with jobs_lock:
-        if task_id not in jobs:
-            return
-        jobs[task_id].update(status="running", updated_at=time.time())
+def _search_worker(task_id, query, user_id):
+    logger.info("Avvio ricerca %s per il codice %s", task_id, query)
     try:
-        result = avvia_scraping_siti(query)
-        result["status"] = "completed"
+        summary = avvia_scraping_siti(query)
+        result = {
+            "status": "completed",
+            "code": query,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            **summary,
+        }
+        with _jobs_lock:
+            jobs[task_id] = {**result, "user_id": user_id}
+            saved_searches[(user_id, query.upper())] = result
+        try:
+            with app.app_context():
+                history = SearchHistory.query.filter_by(user_id=user_id, code=query.upper()).first()
+                if history is None:
+                    history = SearchHistory(user_id=user_id, code=query.upper(), result=result)
+                    db.session.add(history)
+                else:
+                    history.result = result
+                    history.updated_at = datetime.now(timezone.utc)
+                db.session.commit()
+        except Exception as exc:
+            with app.app_context():
+                db.session.rollback()
+            logger.warning("Storico locale non salvato: %s", exc)
         try:
             salva_ricerca(user_id, query, result)
-        except Exception:
-            logger.exception("Impossibile salvare lo storico della ricerca %s", query)
-        with jobs_lock:
-            jobs[task_id] = {
-                **result,
-                "user_id": user_id,
-                "updated_at": time.time(),
-            }
+        except Exception as exc:
+            logger.warning("Risultato non salvato nel database: %s", exc)
     except Exception as exc:
-        logger.exception("Ricerca fallita per %s", query)
-        with jobs_lock:
+        logger.exception("Ricerca %s fallita", task_id)
+        with _jobs_lock:
             jobs[task_id] = {
-                "status": "failed",
-                "error": str(exc),
-                "user_id": user_id,
-                "updated_at": time.time(),
+                "status": "failed", "error": str(exc), "user_id": user_id
             }
+    finally:
+        with _jobs_lock:
+            _active_searches[user_id] = max(0, _active_searches.get(user_id, 1) - 1)
 
 
 @app.route('/api/search', methods=['POST'])
@@ -297,104 +311,196 @@ def search_worker(task_id, query, user_id):
 @csrf_required
 def start_search():
     data = request.get_json(silent=True) or {}
+    query = clean(data.get('query'))
+    if not query:
+        return jsonify({'error': 'Codice vuoto'}), 400
+    if len(query) > 100:
+        return jsonify({'error': 'Codice troppo lungo'}), 400
+
+    task_id = str(uuid.uuid4())
+    user_id = session['user_id']
+    with _jobs_lock:
+        if _active_searches.get(user_id, 0) >= 2:
+            return jsonify({'error': 'Hai già 2 ricerche in corso'}), 429
+        _active_searches[user_id] = _active_searches.get(user_id, 0) + 1
+        jobs[task_id] = {'status': 'pending', 'user_id': user_id}
     try:
-        query = validate_code(data.get('query'))
-    except ValueError as exc:
-        return jsonify({'error': str(exc)}), 400
-
-    user_id = int(session["user_id"])
-    with jobs_lock:
-        _cleanup_jobs()
-        active = sum(
-            job.get("user_id") == user_id and job.get("status") in {"pending", "running"}
-            for job in jobs.values()
-        )
-        if active >= MAX_ACTIVE_JOBS_PER_USER:
-            return jsonify({'error': 'Hai gia due ricerche in corso'}), 429
-        task_id = str(uuid.uuid4())
-        jobs[task_id] = {
-            'status': 'pending',
-            'user_id': user_id,
-            'updated_at': time.time(),
-        }
-
-    search_executor.submit(search_worker, task_id, query, user_id)
+        search_executor.submit(_search_worker, task_id, query, user_id)
+    except Exception:
+        with _jobs_lock:
+            jobs.pop(task_id, None)
+            _active_searches[user_id] = max(0, _active_searches[user_id] - 1)
+        raise
     return jsonify({'task_id': task_id}), 202
 
-#restituisce lo stato attuale o i risultati della ricerca tramite task_id
+#
+def avvia_scraping_siti(codice):
+    sites = load_sites()
+    results = run_sites(sites, codice)
+
+    return {
+        "found_sites": sum(r["found"] for r in results),
+        "total_sites": len(results),
+        "price_sites": sum(r["verified_prices"] for r in results),
+        "results": results,
+        "comparison": build_comparison(results),
+    }
+
 @app.route('/api/search/status/<task_id>', methods=['GET'])
 @login_required
 def check_status(task_id):
-    with jobs_lock:
-        job = dict(jobs.get(task_id) or {})
-    if not job or job.get("user_id") != int(session["user_id"]):
+    job = jobs.get(task_id)
+    if not job or job.get('user_id') != session['user_id']:
         return jsonify({'status': 'failed', 'error': 'Task non trovato'}), 404
-    job.pop("user_id", None)
-    job.pop("updated_at", None)
-    return jsonify(job)
+    return jsonify({key: value for key, value in job.items() if key != 'user_id'})
+
+
+#verifica l'URL, aggiunge http/https se mancano
+def normalize_base(url):
+    url=clean(url)
+    if not url:return None
+    if not url.startswith(("http://","https://")): url="https://"+url
+    try:
+        p=urlparse(url)
+        return f"{p.scheme}://{p.netloc}" if p.netloc else None
+    except:return None
+
 
 def load_sites():
-    with open(os.path.join(ROOT,"sites.json"),"r",encoding="utf-8") as f:
-        return json.load(f)
-
-#verifica l'URL e impedisce accessi a localhost o reti private
-@lru_cache(maxsize=512)
-def hostname_is_public(hostname):
+    """Carica la configurazione dei fornitori senza rendere inutilizzabile l'app."""
+    path = os.path.join(ROOT, "sites.json")
     try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, None)}
-    except socket.gaierror:
-        return False
-    if not addresses:
-        return False
-    for address in addresses:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
-        if not ip.is_global:
-            return False
-    return True
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Impossibile leggere %s: %s", path, exc)
+        return []
+    if not isinstance(data, list):
+        logger.error("%s deve contenere una lista", path)
+        return []
+    return [
+        {"name": clean(item.get("name")), "url": clean(item.get("url"))}
+        for item in data
+        if isinstance(item, dict) and clean(item.get("url"))
+    ]
 
 
-def normalize_base(url):
-    url = clean(url)
-    if not url:
-        return None
-    if "://" not in url:
-        url = "https://" + url
+def build_dashboard(user_id):
+    """Prepara statistiche reali e serializzabili per la pagina principale."""
+    searches = []
+    seen_codes = set()
+
+    for key, result in reversed(list(saved_searches.items())):
+        if not isinstance(key, tuple) or key[0] != user_id or not isinstance(result, dict):
+            continue
+        code = clean(result.get("code") or key[1]).upper()
+        if code and code not in seen_codes:
+            searches.append((code, result, result.get("completed_at")))
+            seen_codes.add(code)
+
     try:
-        parsed = urlparse(url)
-        if parsed.scheme.lower() not in {"http", "https"}:
-            return None
-        if not parsed.hostname or parsed.username or parsed.password:
-            return None
-        if not hostname_is_public(parsed.hostname.lower()):
-            return None
-        port = f":{parsed.port}" if parsed.port else ""
-        return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
-    except (TypeError, ValueError):
-        return None
+        local_rows = SearchHistory.query.filter_by(user_id=user_id).order_by(
+            SearchHistory.updated_at.desc()
+        ).limit(30).all()
+    except Exception as exc:
+        logger.debug("Storico locale non disponibile: %s", exc)
+        local_rows = []
+    for row in local_rows:
+        code = clean(row.code).upper()
+        if code and code not in seen_codes and isinstance(row.result, dict):
+            searches.append((code, row.result, row.updated_at))
+            seen_codes.add(code)
+
+    try:
+        stored = get_ricerche_recenti(user_id, 30)
+    except Exception as exc:
+        logger.debug("Storico non disponibile per la home: %s", exc)
+        stored = []
+    for code, result, updated_at in stored:
+        code = clean(code).upper()
+        if code and code not in seen_codes and isinstance(result, dict):
+            searches.append((code, result, updated_at))
+            seen_codes.add(code)
+
+    products = []
+    total_offers = 0
+    for code, result, updated_at in searches:
+        prices = []
+        result_sites = result.get("results") or []
+        for site in result_sites:
+            if not isinstance(site, dict):
+                continue
+            values = list((site.get("neutral") or {}).values())
+            values += list((site.get("printed") or {}).values())
+            if site.get("generic") is not None:
+                values.append(site["generic"])
+            for value in values:
+                try:
+                    prices.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+        total_offers += len(prices)
+        best = min(prices) if prices else None
+        highest = max(prices) if prices else None
+        saving = round((highest - best) / highest * 100, 1) if best is not None and highest and highest > best else None
+        moment = updated_at or result.get("completed_at")
+        if isinstance(moment, str):
+            try:
+                moment = datetime.fromisoformat(moment.replace("Z", "+00:00"))
+            except ValueError:
+                moment = None
+        date_label = moment.astimezone().strftime("%d/%m/%Y · %H:%M") if isinstance(moment, datetime) else "Data non disponibile"
+        products.append({
+            "code": code,
+            "date": date_label,
+            "found_sites": int(result.get("found_sites") or 0),
+            "total_sites": int(result.get("total_sites") or len(result_sites)),
+            "price_sites": int(result.get("price_sites") or 0),
+            "best_price": best,
+            "highest_price": highest,
+            "saving": saving,
+            "results": result_sites,
+        })
+
+    return {
+        "products": products,
+        "product_count": len(products),
+        "offer_count": total_offers,
+        "company_count": len(load_sites()),
+    }
 
 #estrae il dominio dall'URL e rimuove il prefisso www
 def domain(url):
-    try:return (urlparse(url).hostname or "").lower().removeprefix("www.")
+    try:return urlparse(url).netloc.lower().replace("www.","")
     except:return ""
+
+
+def is_safe_public_url(url):
+    """Blocca protocolli non web e destinazioni locali/private (protezione SSRF)."""
+    try:
+        parsed = urlparse(clean(url))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return False
+        try:
+            addresses = [ipaddress.ip_address(hostname)]
+        except ValueError:
+            addresses = [
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+            ]
+        return bool(addresses) and all(address.is_global for address in addresses)
+    except (OSError, ValueError):
+        return False
 
 #verifica se due URL appartengono allo stesso dominio o a un sotto-dominio
 def same_domain(url,base):
     a,b=domain(url),domain(base)
     return bool(a and b and (a==b or a.endswith("."+b)))
-
-
-def is_safe_public_url(url):
-    try:
-        parsed = urlparse(clean(url))
-        return bool(
-            parsed.scheme.lower() in {"http", "https"}
-            and parsed.hostname
-            and not parsed.username
-            and not parsed.password
-            and hostname_is_public(parsed.hostname.lower())
-        )
-    except (TypeError, ValueError):
-        return False
 
 #controlla se l'URL inserito corrisponde alla home page
 def is_home(url):
@@ -408,39 +514,9 @@ def is_listing(url):
     low=(url or "").lower()
     return any(x in low for x in ("/search","catalogsearch","/cerca","?q=","&q=","?s=","&s=","/ricerca","/results"))
 
-#scarica una pagina controllando anche ogni destinazione di redirect
-def request_url(method, url, **kwargs):
-    current = clean(url)
-    current_method = method.upper()
-    data = kwargs.pop("data", None)
-    for _ in range(6):
-        if not is_safe_public_url(current):
-            raise ValueError("URL non pubblico o non consentito")
-        response = requests.request(
-            current_method,
-            current,
-            headers=HEADERS,
-            timeout=TIMEOUT,
-            allow_redirects=False,
-            data=data if current_method == "POST" else None,
-            **kwargs,
-        )
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            return response
-        location = response.headers.get("Location")
-        if not location:
-            return response
-        current = urljoin(current, location)
-        if response.status_code == 303 or (
-            response.status_code in {301, 302} and current_method == "POST"
-        ):
-            current_method = "GET"
-            data = None
-    raise requests.TooManyRedirects("Troppi redirect")
-
-
+#scarica il contenuto della pagina web dall'URL fornito
 def get(url):
-    return request_url("GET", url)
+    return requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
 
 #estrae e pulisce il prezzo numerico da un testo generico
 def parse_price(raw):
@@ -451,19 +527,25 @@ def parse_price(raw):
         return round(v, 4) if 0.01 <= v < 100000 else None
 
     s = clean(raw).replace("\xa0", " ").strip()
-
-    number = r"\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{1,4})?|\d{1,6}(?:[.,]\d{1,4})?|\d{1,6}"
+    number = r"\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,4})?|\d{1,3}(?:,\d{3})*(?:\.\d{1,4})?|\d{1,6}(?:[.,]\d{1,4})?"
     patterns = (
-        rf"(?:prezzo|price|costo|cost)\s*(?:unitario|cad\.?|:){{0,1}}\s*(?:€|eur)?\s*({number})",
-        rf"(?:€|eur)\s*({number})(?![A-Za-z0-9])",
-        rf"(?<![A-Za-z0-9])({number})\s*(?:€|eur)\b",
-        rf"(?<![A-Za-z0-9])({number})(?![A-Za-z0-9])",
+        rf"(?:prezzo|price|costo|cost)\s*(?:unitario|unit|cad\.?|cadauno)?\s*[:=]?\s*(?:€|eur)?\s*(?P<n>{number})",
+        rf"(?:€|eur)\s*(?P<n>{number})",
+        rf"(?P<n>{number})\s*(?:€|eur)(?!\w)",
     )
-    m = next((match for pattern in patterns if (match := re.search(pattern, s, re.I))), None)
-    if not m:
-        return None
-
-    n = m.group(1).replace(" ", "")
+    match = next((found for pattern in patterns if (found := re.search(pattern, s, re.I))), None)
+    if match:
+        n = match.group("n")
+    elif re.fullmatch(rf"\s*{number}\s*", s):
+        n = s
+    else:
+        # Nei listini il simbolo valuta può mancare, ma un valore decimale è
+        # molto più plausibile come prezzo di un codice SKU o una quantità.
+        match = re.search(r"(?<!\d)(\d{1,6}[.,]\d{1,4})(?!\d)", s)
+        if not match:
+            return None
+        n = match.group(1)
+    n = n.replace(" ", "")
 
     #gestione combinata di virgola e punto
     if "," in n and "." in n:
@@ -626,6 +708,24 @@ def enhanced_search_query(base, code, fingerprint=None):
     return " ".join(parts)
 
 
+#salva i risultati del match in postgres
+def salva_il_match(prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto):
+    try:
+        conn = get_connection()  #la funzione di connessione
+        cur = conn.cursor()
+
+        query = """
+            INSERT INTO risultati_match 
+            (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto, data_rilevazione)
+            VALUES (%s, %s, %s, %s, %s, NOW());
+        """
+        cur.execute(query, (prodotto_id, sito_id, prezzo, score_affidabilita, url_prodotto))
+        
+        conn.commit()  #senza questo Postgres annulla l'inserimento!
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Errore durante il salvataggio su DB: {e}")
 # ---------------- CACHE ----------------
 
 #previene la corruzione del file di cache
@@ -639,6 +739,8 @@ def safe_save_json(filepath, data):
     os.replace(temp_name, filepath)
 
 #legge e carica in memoria tutti i dati salvati nel file della cache
+PENDING_CACHE_FILE = os.path.join(ROOT, "product_cache_pending.json")
+
 def cache_load():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -679,33 +781,37 @@ def cache_delete(base,code):
 @app.route('/api/search/check', methods=['GET'])
 @login_required
 def check_search_exists():
-    try:
-        query = validate_code(request.args.get('query')).upper()
-        previous = get_ricerca_precedente(int(session["user_id"]), query)
-    except ValueError:
-        return jsonify({"has_previous": False})
-    except Exception:
-        logger.exception("Errore durante la lettura dello storico")
-        return jsonify({"error": "Storico temporaneamente non disponibile"}), 503
-    return jsonify({"has_previous": previous is not None})
+    query = request.args.get('query', '').strip().upper()
+    key = (session['user_id'], query)
+    has_prev = key in saved_searches
+    if query and not has_prev:
+        try:
+            previous = get_ricerca_precedente(session['user_id'], query)
+        except Exception:
+            previous = None
+        if previous:
+            saved_searches[key] = previous
+            has_prev = True
+    return jsonify({"has_previous": has_prev})
 
 #restituisce imediatamente i risultati della ricerca precedente
 @app.route('/api/search/previous', methods=['GET'])
 @login_required
 def get_previous_search():
+    query = request.args.get('query', '').strip().upper()
+    key = (session['user_id'], query)
+    if key in saved_searches:
+        return jsonify(saved_searches[key])
     try:
-        query = validate_code(request.args.get('query')).upper()
-        previous = get_ricerca_precedente(int(session["user_id"]), query)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        previous = get_ricerca_precedente(session['user_id'], query) if query else None
     except Exception:
-        logger.exception("Errore durante la lettura dello storico")
-        return jsonify({"error": "Storico temporaneamente non disponibile"}), 503
-    if previous is not None:
+        previous = None
+    if previous:
+        saved_searches[key] = previous
         return jsonify(previous)
     return jsonify({"error": "Nessuna ricerca precedente trovata"}), 404
 
-#aggiornamento del worker in background per salavre l'ultimo risultato ottenuto
+
 # ---------------- PRODUCT VERIFICATION ----------------
 
 #controlla se il codice è presente nell'URl, nel titolo o nel testo del sito
@@ -802,16 +908,16 @@ def exact_code_present(soup, url, code):
         ):
             return True
 
-    # I contenuti JSON-LD non sono sempre inclusi da soup.get_text()
+    # Nei JSON-LD il codice deve essere associato a un campo identificativo:
+    # una semplice citazione tra prodotti correlati non basta.
     for script in soup.select('script[type*="ld+json"]'):
         script_text = script.string or script.get_text(" ", strip=True)
-        if script_text and re.search(
-            rf'"(?:sku|mpn|productID)"\s*:\s*"[^"]*{rx.pattern}[^"]*"',
-            script_text,
+        structured_rx = re.compile(
+            rf'"(?:sku|mpn|productID)"\s*:\s*"{rx.pattern}"',
             re.IGNORECASE,
-        ):
+        )
+        if script_text and structured_rx.search(script_text):
             return True
-
     return False
 
 #scarica una pagina e verifica se è valida, se è la home o se contiene il codice cercato
@@ -819,7 +925,6 @@ def verify_url(base,url,code):
     try:
         r=get(url)
         if not r.ok or "html" not in (r.headers.get("content-type") or "").lower():return None
-        if not same_domain(r.url, base):return None
         if is_home(r.url) or is_listing(r.url):return None
         soup=BeautifulSoup(r.text,"html.parser")
         if not exact_code_present(soup,r.url,code):return None
@@ -877,7 +982,7 @@ def real_search_candidates(base,code):
                 forms.append(((form.get("method") or "get").lower(),urljoin(base,form.get("action") or base),best[1]))
         for method,url,param in forms[:4]:
             try:
-                rr=request_url("POST",url,data={param:code}) if method=="post" else get(url+("&" if "?" in url else "?")+urlencode({param:code}))
+                rr=requests.post(url,data={param:code},headers=HEADERS,timeout=TIMEOUT,allow_redirects=True) if method=="post" else get(url+("&" if "?" in url else "?")+urlencode({param:code}))
                 out.extend(extract_links(rr,base,code,allow_price_cards=True))
             except:pass
     except:pass
@@ -1161,15 +1266,6 @@ def rendered_code_present(page, code):
         if re.search(rf"(?<![A-Z0-9]){re.escape(variant)}(?![A-Z0-9])", hay, re.I):
             return True
 
-    rx = rx_code(code)
-    if rx and re.search(
-        rf"\b(?:cod(?:ice)?|sku|mpn|ref(?:erence)?|art(?:icolo)?|product\s*code)\b"
-        rf"[\s:#=\-]{{0,20}}{rx.pattern}",
-        body,
-        re.IGNORECASE,
-    ):
-        return True
-
     # Structured DOM attributes.
     selectors = [
         '[itemprop="sku"]','[itemprop="mpn"]','[data-sku]',
@@ -1196,13 +1292,22 @@ def rendered_code_present(page, code):
                     return True
         except:
             pass
+    rx = rx_code(code)
+    if rx:
+        label_rx = re.compile(
+            rf"\b(?:cod(?:ice)?|sku|mpn|ref(?:erence)?|art(?:icolo)?|product\s*code|item\s*(?:number|no))\b"
+            rf"[\s:#=\-]{{0,20}}{rx.pattern}",
+            re.IGNORECASE,
+        )
+        if label_rx.search(body):
+            return True
     return False
 
 #raccoglie tutti i dati verificati della pagina e crea la scheda finale del prodotto
-def rendered_product_payload(page, code, source, base=None):
+def rendered_product_payload(page, code, source):
     if is_home(page.url) or is_listing(page.url):
         return None
-    if base and not same_domain(page.url, base):
+    if not rendered_code_present(page, code):
         return None
 
     try:
@@ -1210,8 +1315,6 @@ def rendered_product_payload(page, code, source, base=None):
     except:
         return None
     soup = BeautifulSoup(html, "html.parser")
-    if not exact_code_present(soup, page.url, code):
-        return None
     text = browser_body(page)
     title = browser_title(page) or page_title(soup) or code
 
@@ -1316,7 +1419,7 @@ def browser_open_verified(ctx, url, base, code, source):
             page.wait_for_load_state("networkidle", timeout=3500)
         except:
             page.wait_for_timeout(700)
-        payload = rendered_product_payload(page, code, source, base)
+        payload = rendered_product_payload(page, code, source)
         if payload:
             cache_set(base, code, payload["url"], payload["title"])
             return payload
@@ -1388,7 +1491,7 @@ def browser_resolve_exact(browser, base, code):
                         page.wait_for_timeout(900)
 
                         # Some sites redirect directly to the product.
-                        payload = rendered_product_payload(page, code, "browser - ricerca interna", base)
+                        payload = rendered_product_payload(page, code, "browser - ricerca interna")
                         if payload:
                             cache_set(base, code, payload["url"], payload["title"])
                             return payload
@@ -1532,7 +1635,7 @@ def browser_force_resolve(browser, base, code):
                     remaining = max(1000, int((deadline-time.monotonic())*1000))
                     page.goto(search_url, wait_until="domcontentloaded", timeout=min(6000, remaining))
                     page.wait_for_timeout(1600)
-                    payload = rendered_product_payload(page, code, "browser - ricerca diretta", base)
+                    payload = rendered_product_payload(page, code, "browser - ricerca diretta")
                     if payload:
                         cache_set(base, code, payload["url"], payload["title"])
                         return payload
@@ -1562,7 +1665,13 @@ def browser_force_resolve(browser, base, code):
 
 # Normalizza e pulisce la stringa rimuovendo entità HTML, caratteri invisibili e convertendola in maiuscolo
 def normalize_source(value):
-    return unquote_plus(str(value or "")).upper()
+    value = html.unescape(unquote_plus(str(value or "")))
+    value = unicodedata.normalize("NFKC", value)
+
+    # Rimuove caratteri invisibili che possono spezzare il codice
+    value = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", value)
+
+    return value.upper()
 
 #cerca il codice anche se ci sono spazi, punti o trattini
 def make_code_regex(code):
@@ -1854,7 +1963,6 @@ def run_sites(sites,code):
     V15: browser-first. No product name is required from the user.
     A single Chromium instance is reused across all ecommerce sites.
     """
-    code = validate_code(code).upper()
     resolved = []
     pw = browser = None
     try:
@@ -1886,26 +1994,22 @@ def run_sites(sites,code):
         except:
             pass
 
-    # Il confronto deve restare disponibile anche se il DB e temporaneamente offline.
-    database_ready = True
+    # La ricerca deve restituire i risultati anche se il database storico non
+    # è temporaneamente raggiungibile.
     try:
         salva_prodotto(code, f"prodotto {code}")
-    except Exception:
-        database_ready = False
-        logger.exception("Impossibile salvare il prodotto %s", code)
+    except Exception as exc:
+        logger.warning("Prodotto non salvato nel database: %s", exc)
 
     #genera la lista dei risultati
     risultati=[
         make_result(sites[i], resolved[i][0], resolved[i][1], code)
         for i in range(len(sites))
     ]
-    for index, result in enumerate(risultati):
-        if resolved[index][0] is None:
-            result["status"] = "URL non valido, non raggiungibile o non pubblico"
     
     #salva ogni match nel database
     for res in risultati:
-        if not database_ready or not res.get("found"):
+        if not res.get("found"):
             continue
 
         prezzi = list((res.get("neutral") or {}).values())
@@ -1922,31 +2026,28 @@ def run_sites(sites,code):
                 url_prodotto=res.get("product_url", ""),
                 url_base=res.get("base"),
             )
-        except Exception:
-            logger.exception("Impossibile salvare il match per %s", res["site"])
+        except Exception as exc:
+            logger.warning("Match di %s non salvato: %s", res["site"], exc)
 
     return risultati
 
-#reindirizza automaticamente chi apre il sito alla pagina principale
-@app.route("/")
-
-#mostra la pagina web corretta caricando il rispettivo file html
-def root():return redirect("/automatico" if session.get("user_id") else "/login")
 @app.route("/automatico")
 @login_required
-def automatico():return render_template("automatico.html", csrf_token=get_csrf_token())
+def automatico():
+    return render_template("automatico.html")
 
 #riceve il codice prodotto e restituisce i risultati della ricerca automatica in JSON
 @app.route("/manuale")
 @login_required
-def manuale():return render_template("manuale.html", csrf_token=get_csrf_token())
+def manuale():
+    return redirect("/personalizzati")
 
 #riceve il codice e la lista di siti dall'utente e restituisce i risultati in JSON 
 @app.route("/api/automatico")
 @login_required
 def api_auto():
-    try:code=validate_code(request.args.get("code"))
-    except ValueError as exc:return jsonify({"error":str(exc)}),400
+    code=clean(request.args.get("code"))
+    if not code:return jsonify({"error":"Inserisci un codice valido"}),400
     results=run_sites(load_sites(),code)
     return jsonify({"code":code,"total_sites":len(results),"found_sites":sum(r["found"] for r in results),
                     "price_sites":sum(r["verified_prices"] for r in results),"comparison":build_comparison(results),"results":results})
@@ -1956,28 +2057,17 @@ def api_auto():
 @login_required
 @csrf_required
 def api_manual():
-    data=request.get_json(silent=True) or {}
-    try:code=validate_code(data.get("code"))
-    except ValueError as exc:return jsonify({"error":str(exc)}),400
-    raw_sites=data.get("sites") or []
-    sites=[]
-    for item in raw_sites[:10]:
-        if not isinstance(item,dict) or not clean(item.get("url")):
-            continue
-        base=normalize_base(item.get("url"))
-        if not base:
-            return jsonify({"error":f"URL non valido o non pubblico: {clean(item.get('url'))}"}),400
-        sites.append({"name":clean(item.get("name"))[:120],"url":base})
+    data=request.get_json(silent=True) or {};code=clean(data.get("code"));sites=data.get("sites") or []
+    if not code:return jsonify({"error":"Inserisci un codice valido"}),400
+    if not isinstance(sites, list):return jsonify({"error":"Lista siti non valida"}),400
+    sites=[{"name":clean(x.get("name")),"url":clean(x.get("url"))} for x in sites[:10] if isinstance(x,dict) and clean(x.get("url"))]
     if not sites:return jsonify({"error":"Inserisci almeno un sito"}),400
+    if any(not is_safe_public_url(site["url"]) for site in sites):
+        return jsonify({"error":"Sono ammessi solo URL HTTP/HTTPS pubblici"}),400
     results=run_sites(sites,code)
     return jsonify({"code":code,"total_sites":len(results),"found_sites":sum(r["found"] for r in results),
                     "price_sites":sum(r["verified_prices"] for r in results),"comparison":build_comparison(results),"results":results})
 
 if __name__=="__main__":
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    try:
-        ensure_schema()
-    except Exception:
-        logger.exception("Database non disponibile: i risultati non saranno persistiti")
     print("PriceMatch V15: http://127.0.0.1:5000")
     app.run(host="127.0.0.1",port=5000,debug=False,threaded=True)

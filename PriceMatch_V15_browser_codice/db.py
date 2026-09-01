@@ -205,6 +205,27 @@ def get_ricerca_precedente(utente_id, codice):
         conn.close()
 
 
+def get_ricerche_recenti(utente_id, limite=30):
+    """Restituisce le ultime ricerche dell'utente per alimentare la home."""
+    ensure_schema()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT codice, risultato, aggiornata_il
+                FROM ricerche
+                WHERE utente_id = %s
+                ORDER BY aggiornata_il DESC
+                LIMIT %s;
+                """,
+                (utente_id, max(1, min(int(limite), 100))),
+            )
+            return cursor.fetchall()
+    finally:
+        conn.close()
+
+
 def get_match_precedenti(codice_prodotto):
     conn = get_connection()
     try:
