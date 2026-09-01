@@ -1,4 +1,4 @@
-PRICEMATCH V15 - BROWSER-FIRST, SOLO CODICE
+PRICEMATCH 15  - BROWSER-FIRST, SOLO CODICE
 
 NON serve inserire il nome del prodotto.
 
@@ -18,6 +18,7 @@ Come funziona:
 9. gli URL candidati passano prima da una cache provvisoria;
 10. solo dopo la verifica del codice vengono promossi nella cache definitiva;
 11. le cache salvano soltanto URL/nome, MAI i prezzi.
+12. se è un codice che riconosce ti chiede se vuoi visualizzare le tabelle precedenti o fare il confronto.
 
 Se la ricerca interna fallisce:
 - apre Bing nel browser;
@@ -27,23 +28,5 @@ Se la ricerca interna fallisce:
 
 Questo privilegia l'accuratezza rispetto alla sola velocità.
 
-Prima installazione:
-1. esegui INSTALLA_PRICEMATCH.bat;
-2. configura preferibilmente DATABASE_URL, SECRET_KEY e JWT_SECRET_KEY
-   come indicato in .env.example;
-3. verifica che PostgreSQL sia avviato.
-
-Avvio successivo:
+Avvio:
 AVVIA_PRICEMATCH_V15.bat
-
-Sicurezza e funzionamento:
-- registrazione e login sono obbligatori;
-- le API browser richiedono sessione e token CSRF;
-- localhost, IP privati e protocolli diversi da HTTP/HTTPS non sono ammessi
-  nei siti personalizzati;
-- sono consentite al massimo 2 ricerche contemporanee per utente e 10 siti
-  per confronto manuale;
-- lo storico delle ricerche e salvato nella tabella PostgreSQL `ricerche`.
-
-Test:
-python -m unittest -v
